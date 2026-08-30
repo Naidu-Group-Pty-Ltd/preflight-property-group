@@ -1,0 +1,302 @@
+import { useMemo } from 'react';
+import { format } from 'date-fns';
+import { cn } from '@/lib/utils';
+import { DollarSign, Bell, CheckCircle, Clock, Circle, ReceiptText, Send, Banknote } from 'lucide-react';
+import { Badge } from '@/components/ui/badge';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Skeleton } from '@/components/ui/skeleton';
+import {
+  Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
+} from '@/components/ui/table';
+import type { DealWithClient } from '@/hooks/useAllDeals';
+import { pipelineBadgeClass } from '@/components/deals/pipelineBadgeStyles';
+import { DealLoadingState, NoResultsState } from '@/components/deals/DealStatePresentation';
+
+
+const kpiCardBase = 'relative overflow-hidden rounded-2xl border shadow-xl shadow-sm dark:shadow-black/5 before:absolute before:inset-x-6 before:top-0 before:h-px before:bg-gradient-to-r before:from-transparent before:via-white/70 before:to-transparent';
+const tableShellClass = 'overflow-hidden rounded-2xl border border-border/70 bg-card/80 shadow-xl shadow-sm dark:shadow-black/5';
+const tableHeaderClass = '[&_tr]:border-b [&_tr]:border-border/70 [&_th]:bg-muted/55 [&_th]:py-3 [&_th]:text-[10px] [&_th]:font-bold [&_th]:uppercase [&_th]:tracking-[0.16em] [&_th]:text-muted-foreground';
+const rowHoverClass = 'border-border/55 transition-colors hover:bg-brand-500/5 data-[state=selected]:bg-muted';
+const emptyDashClass = 'inline-flex min-w-6 justify-center rounded-full border border-dashed border-border/80 bg-muted/35 px-2 py-0.5 font-mono text-xs text-muted-foreground';
+
+interface Props {
+  deals: DealWithClient[];
+  isLoading: boolean;
+  onUpdatePayment?: (paymentId: string, clientId: string, data: any) => void;
+}
+
+interface CommissionRow {
+  paymentId: string;
+  dealId: string;
+  clientId: string;
+  clientName: string;
+  stageName: string;
+  stageNumber: number;
+  percentage: number;
+  amount: number | null;
+  builderInvoiceReceived: boolean;
+  submittedToLender: boolean;
+  fundsReleased: boolean;
+  commissionReceived: boolean;
+  commissionReceivedDate: string | null;
+  commissionAmount: number | null;
+  buildPrice: number | null;
+}
+
+export function CommissionDashboard({ deals, isLoading, onUpdatePayment }: Props) {
+  const commissionRows = useMemo(() => {
+    const rows: CommissionRow[] = [];
+    for (const deal of deals) {
+      const payments = deal.buildPayments || [];
+      for (const p of payments) {
+        if (!p.is_commission_trigger) continue;
+        rows.push({
+          paymentId: p.id,
+          dealId: deal.id,
+          clientId: deal.client_id,
+          clientName: deal.client_name || 'Unknown',
+          stageName: p.stage_name,
+          stageNumber: p.stage_number,
+          percentage: p.percentage,
+          amount: deal.build_price ? (deal.build_price * p.percentage / 100) : p.amount,
+          builderInvoiceReceived: p.builder_invoice_received || false,
+          submittedToLender: p.submitted_to_lender || false,
+          fundsReleased: p.funds_released || false,
+          commissionReceived: p.commission_received || false,
+          commissionReceivedDate: p.commission_received_date,
+          commissionAmount: p.commission_amount,
+          buildPrice: deal.build_price,
+        });
+      }
+    }
+    return rows;
+  }, [deals]);
+
+  const stats = useMemo(() => {
+    const pending = commissionRows.filter(r => !r.commissionReceived);
+    const received = commissionRows.filter(r => r.commissionReceived);
+    const pendingSlabs = pending.filter(r => r.stageName === 'Slab/Base');
+    const pendingFrames = pending.filter(r => r.stageName === 'Frame');
+    const totalReceived = received.reduce((s, r) => s + (r.commissionAmount || 0), 0);
+    const totalPending = pending.length;
+    return { pending, received, pendingSlabs, pendingFrames, totalReceived, totalPending };
+  }, [commissionRows]);
+
+  const formatCurrency = (val: number) =>
+    new Intl.NumberFormat('en-AU', { style: 'currency', currency: 'AUD', maximumFractionDigits: 0 }).format(val);
+
+  function ToggleCheck({ value, field, row }: { value: boolean; field: string; row: CommissionRow }) {
+    if (!onUpdatePayment) {
+      return value ? (
+        <CheckCircle className="h-4 w-4 text-success mx-auto" />
+      ) : (
+        <span className={emptyDashClass}>—</span>
+      );
+    }
+
+    const dateField = field === 'builder_invoice_received' ? 'builder_invoice_date'
+      : field === 'submitted_to_lender' ? 'submitted_to_lender_date'
+      : field === 'funds_released' ? 'funds_released_date'
+      : field === 'commission_received' ? 'commission_received_date'
+      : null;
+
+    const handleToggle = () => {
+      const newVal = !value;
+      const update: any = { [field]: newVal };
+      if (dateField) {
+        update[dateField] = newVal ? new Date().toISOString().split('T')[0] : null;
+      }
+      onUpdatePayment(row.paymentId, row.clientId, update);
+    };
+
+    const iconTone = field === 'funds_released'
+      ? 'text-success bg-success/10 border-success/25'
+      : field === 'submitted_to_lender'
+        ? 'text-info bg-info/10 border-info/25'
+        : field === 'builder_invoice_received'
+          ? 'text-brand-700 bg-brand-500/10 border-brand-500/25'
+          : 'text-success bg-success/10 border-success/25';
+
+    return (
+      <button
+        onClick={handleToggle}
+        className={cn(
+          'mx-auto inline-flex h-8 w-8 items-center justify-center rounded-full border transition-all hover:-translate-y-0.5 hover:scale-105 hover:shadow-md',
+          value ? iconTone : 'border-border/70 bg-muted/30 text-muted-foreground/45 hover:border-brand-300/60 hover:bg-brand-500/10 hover:text-brand-700'
+        )}
+        title={`Toggle ${field.replace(/_/g, ' ')}`}
+      >
+        {value ? <CheckCircle className="h-4 w-4" /> : <Circle className="h-4 w-4" />}
+      </button>
+    );
+  }
+
+  if (isLoading) {
+    return (
+      <DealLoadingState title="Loading commission dashboard" description="Reviewing commission triggers, invoice dates and received funds without estimating missing values." />
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      {/* KPI Cards */}
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
+        <Card className={cn(kpiCardBase, 'border-brand-300/45 bg-gradient-to-br from-brand-50 via-card to-warning/80 dark:from-brand-950/35 dark:via-card dark:to-warning/20')}>
+          <CardContent className="p-4 text-center sm:p-5">
+            <Clock className="mx-auto mb-2 h-5 w-5 text-brand-600" />
+            <p className="text-2xl font-black tabular-nums text-brand-700 sm:text-3xl">{stats.totalPending}</p>
+            <p className="mt-1 text-[10px] font-bold uppercase tracking-[0.18em] text-brand-800/75 dark:text-brand-200/80">Pending</p>
+          </CardContent>
+        </Card>
+        <Card className={cn(kpiCardBase, 'border-brand-300/35 bg-gradient-to-br from-card via-brand-50/70 to-card dark:via-brand-950/20')}>
+          <CardContent className="p-4 text-center sm:p-5">
+            <Bell className="mx-auto mb-2 h-5 w-5 text-brand-600" />
+            <p className="text-2xl font-black tabular-nums text-brand-700 sm:text-3xl">{stats.pendingSlabs.length}</p>
+            <p className="mt-1 text-[10px] font-bold uppercase tracking-[0.18em] text-muted-foreground">Slab Pending</p>
+          </CardContent>
+        </Card>
+        <Card className={cn(kpiCardBase, 'border-warning/35 bg-gradient-to-br from-card via-warning/70 to-card dark:via-warning/20')}>
+          <CardContent className="p-4 text-center sm:p-5">
+            <Bell className="mx-auto mb-2 h-5 w-5 text-warning" />
+            <p className="text-2xl font-black tabular-nums text-warning sm:text-3xl">{stats.pendingFrames.length}</p>
+            <p className="mt-1 text-[10px] font-bold uppercase tracking-[0.18em] text-muted-foreground">Frame Pending</p>
+          </CardContent>
+        </Card>
+        <Card className={cn(kpiCardBase, 'border-success/40 bg-gradient-to-br from-success via-card to-success/80 dark:from-success/30 dark:via-card dark:to-success/20')}>
+          <CardContent className="p-4 text-center sm:p-5">
+            <CheckCircle className="mx-auto mb-2 h-5 w-5 text-success" />
+            <p className="text-2xl font-black tabular-nums text-success sm:text-3xl">{stats.received.length}</p>
+            <p className="mt-1 text-[10px] font-bold uppercase tracking-[0.18em] text-success/70 dark:text-success/80">Received</p>
+          </CardContent>
+        </Card>
+        <Card className={cn(kpiCardBase, 'col-span-2 border-success/45 bg-gradient-to-br from-success via-card to-success/80 dark:from-success/30 dark:via-card dark:to-success/20 sm:col-span-1')}>
+          <CardContent className="p-4 text-center sm:p-5">
+            <DollarSign className="mx-auto mb-2 h-5 w-5 text-success" />
+            <p className="text-xl font-black tabular-nums text-success sm:text-2xl">{formatCurrency(stats.totalReceived)}</p>
+            <p className="mt-1 text-[10px] font-bold uppercase tracking-[0.18em] text-success/70 dark:text-success/80">Total Received</p>
+          </CardContent>
+        </Card>
+      </div>
+
+      {/* Pending Commissions */}
+      <Card className="overflow-hidden rounded-2xl border-brand-200/45 bg-gradient-to-br from-card via-card to-brand-50/35 shadow-xl shadow-sm dark:shadow-black/5 dark:border-brand-900/40 dark:to-brand-950/15">
+        <CardHeader className="border-b border-brand-200/35 bg-brand-500/5 pb-3">
+          <CardTitle className="text-sm sm:text-base flex items-center gap-2">
+            <Clock className="h-4 w-4 text-brand-500" />
+            Pending Commission Triggers
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="p-0">
+          <div className={cn(tableShellClass, 'max-w-full overflow-auto rounded-none border-0 shadow-none')}>
+            <Table>
+              <TableHeader className={tableHeaderClass}>
+                <TableRow>
+                  <TableHead className="whitespace-nowrap">Client</TableHead>
+                  <TableHead className="whitespace-nowrap">Stage</TableHead>
+                  <TableHead className="text-right whitespace-nowrap hidden sm:table-cell">%</TableHead>
+                  <TableHead className="text-right whitespace-nowrap hidden sm:table-cell">Amount</TableHead>
+                  <TableHead className="text-center whitespace-nowrap">Invoice</TableHead>
+                  <TableHead className="text-center whitespace-nowrap hidden sm:table-cell">Submitted</TableHead>
+                  <TableHead className="text-center whitespace-nowrap">Funds</TableHead>
+                  <TableHead className="whitespace-nowrap">Status</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {stats.pending.length === 0 ? (
+                  <TableRow>
+                    <TableCell colSpan={8} className="p-4">
+                      <NoResultsState title="No pending commission triggers" description="There are no commission events waiting in this view. Received and zero-value states remain visible where recorded." />
+                    </TableCell>
+                  </TableRow>
+                ) : (
+                  stats.pending.map((row, idx) => (
+                    <TableRow key={`${row.dealId}-${row.stageNumber}-${idx}`} className={rowHoverClass}>
+                      <TableCell className="py-3.5 font-semibold text-xs sm:text-sm whitespace-nowrap">{row.clientName}</TableCell>
+                      <TableCell>
+                        <div className="flex items-center gap-1">
+                          <Bell className="h-3.5 w-3.5 text-brand-500 shrink-0" />
+                          <span className="text-xs sm:text-sm">{row.stageName}</span>
+                        </div>
+                      </TableCell>
+                      <TableCell className="hidden text-right font-mono text-xs font-semibold text-muted-foreground sm:table-cell">{row.percentage}%</TableCell>
+                      <TableCell className="hidden text-right text-xs font-bold text-brand-700 tabular-nums sm:table-cell sm:text-sm">{row.amount ? formatCurrency(row.amount) : <span className={emptyDashClass}>—</span>}</TableCell>
+                      <TableCell className="text-center">
+                        <ToggleCheck value={row.builderInvoiceReceived} field="builder_invoice_received" row={row} />
+                      </TableCell>
+                      <TableCell className="text-center hidden sm:table-cell">
+                        <ToggleCheck value={row.submittedToLender} field="submitted_to_lender" row={row} />
+                      </TableCell>
+                      <TableCell className="text-center">
+                        <ToggleCheck value={row.fundsReleased} field="funds_released" row={row} />
+                      </TableCell>
+                      <TableCell>
+                        <button
+                          onClick={() => onUpdatePayment?.(row.paymentId, row.clientId, {
+                            commission_received: true,
+                            commission_received_date: new Date().toISOString().split('T')[0],
+                          })}
+                          className="rounded-full transition-transform hover:-translate-y-0.5 hover:shadow-md"
+                          title="Mark commission as received"
+                        >
+                          {row.fundsReleased ? (
+                            <Badge className={pipelineBadgeClass('warning', false, 'whitespace-nowrap transition-colors hover:bg-brand-500/20')}><Banknote className="mr-1 h-3 w-3" />Awaiting</Badge>
+                          ) : row.submittedToLender ? (
+                            <Badge variant="outline" className={pipelineBadgeClass('warning', false, 'whitespace-nowrap')}><Send className="mr-1 h-3 w-3" />Submitted</Badge>
+                          ) : row.builderInvoiceReceived ? (
+                            <Badge variant="outline" className={pipelineBadgeClass('warning', false, 'whitespace-nowrap')}><ReceiptText className="mr-1 h-3 w-3" />Invoice</Badge>
+                          ) : (
+                            <span className={emptyDashClass}>—</span>
+                          )}
+                        </button>
+                      </TableCell>
+                    </TableRow>
+                  ))
+                )}
+              </TableBody>
+            </Table>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Received Commissions */}
+      {stats.received.length > 0 && (
+        <Card className="overflow-hidden rounded-2xl border-success/45 bg-gradient-to-br from-card via-card to-success/35 shadow-xl shadow-sm dark:shadow-black/5 dark:border-success/40 dark:to-success/15">
+          <CardHeader className="border-b border-success/35 bg-success/5 pb-3">
+            <CardTitle className="text-sm sm:text-base flex items-center gap-2">
+              <DollarSign className="h-4 w-4 text-success" />
+              Received Commissions
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="p-0">
+            <div className={cn(tableShellClass, 'max-w-full overflow-auto rounded-none border-0 shadow-none')}>
+              <Table>
+                <TableHeader className={tableHeaderClass}>
+                  <TableRow>
+                    <TableHead className="whitespace-nowrap">Client</TableHead>
+                    <TableHead className="whitespace-nowrap">Stage</TableHead>
+                    <TableHead className="text-right whitespace-nowrap">Amount</TableHead>
+                    <TableHead className="whitespace-nowrap">Date</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {stats.received.map((row, idx) => (
+                    <TableRow key={`recv-${row.dealId}-${row.stageNumber}-${idx}`} className="border-border/55 transition-colors hover:bg-success/5">
+                      <TableCell className="py-3.5 font-semibold text-xs sm:text-sm">{row.clientName}</TableCell>
+                      <TableCell className="text-xs sm:text-sm">{row.stageName}</TableCell>
+                      <TableCell className="text-right font-mono text-xs font-bold text-brand-700 sm:text-sm">
+                        {row.commissionAmount ? formatCurrency(row.commissionAmount) : <span className={emptyDashClass}>—</span>}
+                      </TableCell>
+                      <TableCell className="text-xs sm:text-sm">
+                        {row.commissionReceivedDate ? format(new Date(row.commissionReceivedDate), 'dd MMM yyyy') : <span className={emptyDashClass}>—</span>}
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+    </div>
+  );
+}

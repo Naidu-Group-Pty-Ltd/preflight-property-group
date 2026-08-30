@@ -1,0 +1,290 @@
+import { useState, useCallback, useRef } from 'react';
+import { invokeSecureFunction } from '@/lib/secureInvoke';
+import { toast } from 'sonner';
+import { sectionCountForTier, normaliseReportTier } from '@/lib/reports/compassSectionRegistry';
+
+export type RegenerationPhase = 'idle' | 'generate' | 'condense' | 'qa' | 'done';
+
+export type GenerationEngine = 'legacy' | 'compass-40';
+
+interface ChunkedRegenerationOptions {
+  reportId: string;
+  propertyAddress: string;
+  generationEngine?: GenerationEngine;
+  manualOverrides?: Record<string, any>;
+  financialCalculations?: Record<string, any>;
+  currentReportContent?: string;
+  onProgress?: (section: number, total: number, phase: RegenerationPhase) => void;
+  onComplete?: () => void;
+  onError?: (error: string) => void;
+}
+
+interface RegenerationState {
+  isRegenerating: boolean;
+  currentSection: number;
+  totalSections: number;
+  phase: RegenerationPhase;
+  tier: 'compass-40' | 'financial-analysis';
+  error: string | null;
+}
+
+const MAX_RETRIES_PER_SECTION = 2;
+const DEFAULT_TIER: 'compass-40' = 'compass-40';
+
+export function useChunkedRegeneration() {
+  const [state, setState] = useState<RegenerationState>({
+    isRegenerating: false,
+    currentSection: 0,
+    totalSections: sectionCountForTier(DEFAULT_TIER),
+    phase: 'idle',
+    tier: DEFAULT_TIER,
+    error: null,
+  });
+
+  const abortRef = useRef(false);
+
+  const regenerate = useCallback(async (options: ChunkedRegenerationOptions) => {
+    const {
+      reportId,
+      propertyAddress,
+      generationEngine,
+      manualOverrides = {},
+      financialCalculations = {},
+      onProgress,
+      onComplete,
+      onError,
+    } = options;
+
+    abortRef.current = false;
+
+    const toastId = toast.loading('Starting regeneration...', {
+      description: 'Preparing to regenerate report in chunks...'
+    });
+
+    try {
+      // Fetch current report state — include `report_tier` so we know the section count.
+      const { data: reportData, error: fetchError } = await invokeSecureFunction('get-investment-reports', {
+        reportId,
+        listOptions: {
+          select: 'report_content, manual_overrides, financial_calculations, last_completed_section, status, current_version, property_address, report_scope, report_tier, generation_engine, total_sections'
+        }
+      });
+
+      if (fetchError) {
+        throw new Error(fetchError.message || 'Failed to fetch report');
+      }
+
+      const report = reportData?.report;
+      const tier = normaliseReportTier(report?.report_tier);
+      // Prefer the actual chunk count persisted by the edge function (so
+      // legacy engine reports show the real number of chunks, not the
+      // Compass-40 default of 17).
+      const persistedTotal = Number(report?.total_sections) || 0;
+      const totalSections = persistedTotal > 0 ? persistedTotal : sectionCountForTier(tier);
+      const existingCompletedSection = Math.min(
+        Math.max(Number(report?.last_completed_section) || 0, 0),
+        totalSections,
+      );
+      const isInterruptedRun = ['processing', 'failed', 'pending'].includes(String(report?.status || '').toLowerCase());
+      const hasPartialProgress = Boolean(report?.report_content) && existingCompletedSection > 0;
+      const shouldResumeGeneration = isInterruptedRun && hasPartialProgress && existingCompletedSection < totalSections;
+      const shouldResumePostProcessing = isInterruptedRun && hasPartialProgress && existingCompletedSection >= totalSections;
+
+      setState({
+        isRegenerating: true,
+        currentSection: 0,
+        totalSections,
+        phase: 'generate',
+        tier,
+        error: null,
+      });
+
+      // Mark processing without destroying resume state. Reset to section 0 only
+      // when there is no usable partial progress; otherwise continue from the
+      // last successfully saved section.
+      // Resolve effective engine: explicit option wins; else stored value; else default 'legacy'.
+      const effectiveEngine: GenerationEngine =
+        generationEngine ?? (tier === 'compass-40' ? 'compass-40' : (report?.generation_engine === 'compass-40' ? 'compass-40' : 'legacy'));
+
+      const startPayload: Record<string, any> = {
+        status: 'processing',
+        error_message: null,
+        generation_engine: effectiveEngine,
+      };
+      if (!shouldResumeGeneration && !shouldResumePostProcessing) {
+        startPayload.last_completed_section = 0;
+      }
+
+      // Retry on transient statement-timeouts
+      // (Postgres 57014) and other 5xx blips. The first reset writes
+      // status='processing' which fires the archive_report_version trigger;
+      // under polling contention that single call can occasionally exceed the
+      // DB statement timeout. Retrying keeps the regeneration alive.
+      let resetOk = false;
+      let resetErr: any = null;
+      for (let attempt = 0; attempt < 3 && !resetOk; attempt++) {
+        if (attempt > 0) {
+          await new Promise((r) => setTimeout(r, 1500 * attempt));
+        }
+        const { error } = await invokeSecureFunction('manage-investment-reports', {
+          action: 'update',
+          reportId,
+          data: startPayload,
+        });
+        if (!error) { resetOk = true; break; }
+        resetErr = error;
+        console.warn(`[ChunkedRegeneration] Reset attempt ${attempt + 1} failed:`, error.message || error);
+      }
+      if (!resetOk) {
+        throw new Error(`Failed to start regeneration: ${resetErr?.message || 'unknown error'}`);
+      }
+
+      const effectivePropertyAddress = propertyAddress || report?.property_address || '';
+      const startSection = shouldResumeGeneration || shouldResumePostProcessing ? existingCompletedSection : 0;
+
+      // ── Phase 1: Generate sections ────────────────────────────────────────
+      let allSectionsComplete = false;
+      for (let section = startSection; section < totalSections; section++) {
+        if (abortRef.current) {
+          console.log('[ChunkedRegeneration] Aborted by user');
+          break;
+        }
+
+        setState(prev => ({ ...prev, currentSection: section + 1, phase: 'generate' }));
+        onProgress?.(section + 1, totalSections, 'generate');
+
+        toast.loading(`Generating section ${section + 1}/${totalSections}…`, {
+          id: toastId,
+          description: tier === 'financial-analysis'
+            ? 'Financial Analysis Report'
+            : 'Compass-40 Report',
+        });
+
+        let sectionSuccess = false;
+        let lastError = '';
+
+        for (let retry = 0; retry < MAX_RETRIES_PER_SECTION && !sectionSuccess; retry++) {
+          if (retry > 0) {
+            await new Promise(resolve => setTimeout(resolve, 2000));
+          }
+
+          const { data, error } = await invokeSecureFunction('generate-investment-report', {
+            reportId,
+            propertyAddress: effectivePropertyAddress,
+            propertyDetails: {
+              queryType: report?.report_scope || 'address',
+              reportTier: tier,
+              generationEngine: effectiveEngine,
+              manualOverrides: manualOverrides || report?.manual_overrides || {},
+              ...financialCalculations,
+              ...(report?.financial_calculations || {}),
+            },
+            continueFrom: true,
+            singleSection: true,
+          }, { timeoutMs: 180000 });
+
+          if (error) {
+            lastError = error.message || 'Unknown error';
+            console.error(`[ChunkedRegeneration] Section ${section + 1} error:`, lastError);
+            continue;
+          }
+
+          if (data?.success) {
+            sectionSuccess = true;
+            if (data.isComplete) {
+              console.log('[ChunkedRegeneration] All sections complete');
+              allSectionsComplete = true;
+              break;
+            }
+          } else {
+            lastError = data?.error || 'Section generation failed';
+          }
+        }
+
+        if (!sectionSuccess) {
+          throw new Error(`Failed to generate section ${section + 1}: ${lastError}`);
+        }
+
+        // The edge function reports completion the moment the last section
+        // lands. Without this the outer loop kept calling for section indices
+        // that were already generated — every one of them a full round-trip
+        // that skipped straight to finalisation and did the post-processing
+        // again.
+        if (allSectionsComplete) break;
+      }
+
+      // ── Phase 2: Condense + page-pressure trim ────────────────────────────
+      if (!abortRef.current) {
+        setState(prev => ({ ...prev, phase: 'condense', currentSection: totalSections }));
+        onProgress?.(totalSections, totalSections, 'condense');
+        toast.loading('Condensing report (word caps + page pressure)…', { id: toastId });
+
+        try {
+          await invokeSecureFunction('condense-investment-report', { reportId, tier }, { timeoutMs: 180000 });
+        } catch (e: any) {
+          console.warn('[ChunkedRegeneration] Condense step soft-failed:', e?.message);
+        }
+      }
+
+      // ── Phase 3: QA validation (server returns qaReport inside condense response;
+      //              we surface the phase for UX even though the work happens
+      //              inside the same edge call). ───────────────────────────────
+      if (!abortRef.current) {
+        setState(prev => ({ ...prev, phase: 'qa' }));
+        onProgress?.(totalSections, totalSections, 'qa');
+        toast.loading('Running QA checks…', { id: toastId });
+      }
+
+      // Final status check
+      const { data: finalData } = await invokeSecureFunction('get-investment-reports', {
+        reportId,
+        listOptions: { select: 'status, current_version, last_completed_section' }
+      });
+
+      const finalReport = finalData?.report;
+
+      if (finalReport?.last_completed_section >= totalSections) {
+        toast.success('Report regenerated successfully', {
+          id: toastId,
+          description: `Version ${finalReport.current_version || 'new'} created`,
+        });
+
+        setState(prev => ({
+          ...prev,
+          isRegenerating: false,
+          currentSection: totalSections,
+          phase: 'done',
+        }));
+        onComplete?.();
+      } else {
+        throw new Error('Report regeneration incomplete');
+      }
+
+    } catch (error: any) {
+      console.error('[ChunkedRegeneration] Error:', error);
+      const errorMessage = error.message || 'Regeneration failed';
+
+      setState(prev => ({ ...prev, isRegenerating: false, phase: 'idle', error: errorMessage }));
+
+      toast.error('Regeneration failed', { id: toastId, description: errorMessage });
+
+      await invokeSecureFunction('manage-investment-reports', {
+        action: 'update',
+        reportId,
+        data: { status: 'failed' }
+      });
+
+      onError?.(errorMessage);
+    }
+  }, []);
+
+  const abort = useCallback(() => {
+    abortRef.current = true;
+  }, []);
+
+  return {
+    ...state,
+    regenerate,
+    abort,
+  };
+}

@@ -1,0 +1,310 @@
+import { useState, useEffect, useMemo, useRef } from 'react';
+import { useParams, useNavigate, useLocation } from 'react-router-dom';
+import { format } from 'date-fns';
+import { invokeSecureFunction } from '@/lib/secureInvoke';
+import type { PixelPerfectPDFGeneratorHandle } from '@/components/reports/PixelPerfectPDFGenerator';
+import { InvestmentReportEditor } from '@/components/reports/InvestmentReportEditor';
+import { ManualDataOverrideModal } from '@/components/reports/ManualDataOverrideModal';
+import { SendToClientModal } from '@/components/reports/SendToClientModal';
+import { HeroImageStudio } from '@/components/reports/HeroImageStudio';
+import { ReportVersionHistory } from '@/components/reports/ReportVersionHistory';
+import { DEFAULT_PDF_DESIGN_OPTIONS, type PdfDesignOptions } from '@/components/reports/premiumPdfDesign';
+import { InvestmentReportCommandHeader } from '@/components/reports/report-view/InvestmentReportCommandHeader';
+import { InvestmentReportDocument } from '@/components/reports/report-view/InvestmentReportDocument';
+import { InvestmentReportErrorState } from '@/components/reports/report-view/InvestmentReportErrorState';
+import { InvestmentReportExportPanel } from '@/components/reports/report-view/InvestmentReportExportPanel';
+import { InvestmentReportHero } from '@/components/reports/report-view/InvestmentReportHero';
+import { InvestmentReportLoadingState } from '@/components/reports/report-view/InvestmentReportLoadingState';
+import { InvestmentReportMobileActionBar } from '@/components/reports/report-view/InvestmentReportMobileActionBar';
+import { InvestmentReportOverridePanel } from '@/components/reports/report-view/InvestmentReportOverridePanel';
+import type { ClientInfo, InvestmentReport } from '@/components/reports/report-view/types';
+import { getHasOverrides, getOverriddenFields, getReportStatusLabel, getReportTierLabel, getReportVariantLabel } from '@/components/reports/report-view/utils';
+import { logActivityDirect } from '@/hooks/useActivityLogger';
+import {
+  CASH_FLOW_ANALYSIS_BACK_LABEL,
+  CASH_FLOW_ANALYSIS_PATH,
+  cameFromCashFlowAnalysis,
+  navigateBackToCashFlowAnalysis,
+} from '@/lib/navigation/cashFlowOrigin';
+
+export default function InvestmentReportView() {
+  const { id } = useParams<{ id: string }>();
+  const navigate = useNavigate();
+  const location = useLocation();
+  // Set when this report was opened by drilling in from the Cash Flow
+  // Analysis property list. The way back is then a named route rather than a
+  // browser step, so it is right after a refresh or a middle-click too.
+  const fromCashFlowAnalysis = cameFromCashFlowAnalysis(location);
+  const [report, setReport] = useState<InvestmentReport | null>(null);
+  const [clientInfo, setClientInfo] = useState<ClientInfo | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const [editorOpen, setEditorOpen] = useState(false);
+  const [overrideModalOpen, setOverrideModalOpen] = useState(false);
+  const [sendToClientOpen, setSendToClientOpen] = useState(false);
+  const [heroDialogOpen, setHeroDialogOpen] = useState(false);
+  const [versionHistoryOpen, setVersionHistoryOpen] = useState(false);
+  const [includeSources, setIncludeSources] = useState(true);
+  const [includeScoring, setIncludeScoring] = useState(true);
+  const [includeCharts, setIncludeCharts] = useState(true);
+  const [includeHeroImages, setIncludeHeroImages] = useState(false);
+  const [includeSparklines, setIncludeSparklines] = useState(true);
+  const [pdfDesignOptions, setPdfDesignOptions] = useState<PdfDesignOptions>(DEFAULT_PDF_DESIGN_OPTIONS);
+  const [showOverrides, setShowOverrides] = useState(true);
+  const pdfGeneratorRef = useRef<PixelPerfectPDFGeneratorHandle>(null);
+
+  const isClientReport = report?.is_client_report === true;
+
+  useEffect(() => {
+    if (!id) {
+      setError('No report ID provided');
+      setLoading(false);
+      return;
+    }
+
+    const fetchReport = async () => {
+      setLoading(true);
+      setError(null);
+
+      const { data, error: fetchError } = await invokeSecureFunction('get-investment-reports', {
+        reportId: id,
+        listOptions: {
+        select: 'id, property_address, property_listing_id, report_content, sources_content, created_at, status, manual_overrides, financial_calculations, demographics_data, economic_data, investment_score, location_intelligence, is_client_report, client_property_id, current_version, report_tier, report_variant, derived_from_report_id, parent_report_id, pdf_url'
+        }
+      });
+
+      if (fetchError) {
+        console.error('Error fetching report:', fetchError);
+        setError('Failed to load the report. Please try again.');
+        setLoading(false);
+        return;
+      }
+
+      if (!data?.report) {
+        setError('Report not found.');
+        setLoading(false);
+        return;
+      }
+
+      const reportData = data.report;
+      setReport(reportData as InvestmentReport);
+      
+      // If it's a client report, fetch the client info for back navigation
+      if (reportData.is_client_report && reportData.client_property_id) {
+        const { data: clientData } = await invokeSecureFunction('manage-client-data', {
+          operation: 'getClientProperty',
+          clientPropertyId: reportData.client_property_id
+        });
+
+        if (clientData?.property?.clients) {
+          const client = clientData.property.clients as unknown as ClientInfo;
+          setClientInfo(client);
+        }
+      }
+
+      setLoading(false);
+      
+      // Log report viewed
+      logActivityDirect({
+        actionType: 'report_viewed',
+        entityType: 'investment_report',
+        entityId: id,
+        entityName: reportData.property_address,
+        metadata: { source: 'investment_report_view', isClientReport: reportData.is_client_report }
+      });
+    };
+
+    fetchReport();
+  }, [id]);
+
+  const handleReportUpdate = async () => {
+    if (!id) return;
+
+    const { data } = await invokeSecureFunction('get-investment-reports', {
+      reportId: id,
+      listOptions: {
+        select: 'id, property_address, property_listing_id, report_content, sources_content, created_at, status, manual_overrides, financial_calculations, demographics_data, economic_data, investment_score, location_intelligence, is_client_report, client_property_id, current_version, report_tier, report_variant, derived_from_report_id, parent_report_id, pdf_url'
+      }
+    });
+
+    if (data?.report) {
+      setReport(data.report as InvestmentReport);
+    }
+  };
+
+  const handleDownload = () => {
+    if (!report) return;
+    let content = report.report_content;
+    if (includeSources && report.sources_content) {
+      content += report.sources_content;
+    }
+    const blob = new Blob([content], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `investment-report-${report.property_address.replace(/[^a-zA-Z0-9]/g, '-')}-${format(new Date(report.created_at), 'yyyy-MM-dd')}.txt`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const hasOverrides = useMemo(() => getHasOverrides(report), [report]);
+  const reportTierLabel = useMemo(() => getReportTierLabel(report), [report]);
+  const reportVariantLabel = useMemo(() => getReportVariantLabel(report), [report]);
+  const reportStatusLabel = useMemo(() => getReportStatusLabel(report), [report]);
+  const overriddenFields = useMemo(() => getOverriddenFields(report), [report]);
+
+  if (loading) {
+    return <InvestmentReportLoadingState />;
+  }
+
+  if (error || !report) {
+    return (
+      <InvestmentReportErrorState
+        error={error}
+        onBack={() => (fromCashFlowAnalysis ? navigateBackToCashFlowAnalysis(navigate, location) : navigate(-1))}
+      />
+    );
+  }
+
+  return (
+    <div className="flex-1 flex flex-col h-full overflow-hidden">
+      <InvestmentReportCommandHeader
+        report={report}
+        clientInfo={clientInfo}
+        isClientReport={isClientReport}
+        onBack={() => (fromCashFlowAnalysis ? navigateBackToCashFlowAnalysis(navigate, location) : navigate(-1))}
+        backLabel={fromCashFlowAnalysis ? CASH_FLOW_ANALYSIS_BACK_LABEL : undefined}
+        onReportsHome={() => navigate('/generated-reports')}
+        onBackToClient={() => navigate('/clients')}
+        onNavigateToReport={(rid) => navigate(`/investment-report/${rid}`)}
+        onSendToClient={() => setSendToClientOpen(true)}
+        onCashFlow={() => navigate(`${CASH_FLOW_ANALYSIS_PATH}/${report.id}`)}
+        onEdit={() => setEditorOpen(true)}
+        onOverride={() => setOverrideModalOpen(true)}
+        onManageHeroImages={() => setHeroDialogOpen(true)}
+        onOpenVersionHistory={() => setVersionHistoryOpen(true)}
+        onDownload={handleDownload}
+      />
+
+      {/* Main content */}
+      <div className="flex-1 overflow-auto overflow-x-hidden bg-muted/20">
+        <div className="mx-auto w-full max-w-7xl space-y-6 p-4 pb-24 lg:p-6">
+          <InvestmentReportHero
+            report={report}
+            isClientReport={isClientReport}
+            hasOverrides={hasOverrides}
+            reportTierLabel={reportTierLabel}
+            reportVariantLabel={reportVariantLabel}
+            reportStatusLabel={reportStatusLabel}
+          />
+
+          <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_380px] xl:grid-cols-[minmax(0,1fr)_420px]">
+            <main className="min-w-0 order-1">
+              <InvestmentReportDocument
+                report={report}
+                includeSources={includeSources}
+                onDownload={handleDownload}
+              />
+            </main>
+
+            <aside className="order-2 min-w-0 space-y-4 lg:sticky lg:top-24 lg:self-start">
+              <InvestmentReportExportPanel
+                report={report}
+                includeSources={includeSources}
+                includeScoring={includeScoring}
+                includeCharts={includeCharts}
+                includeHeroImages={includeHeroImages}
+                includeSparklines={includeSparklines}
+                pdfDesignOptions={pdfDesignOptions}
+                pdfGeneratorRef={pdfGeneratorRef}
+                onIncludeSourcesChange={setIncludeSources}
+                onIncludeScoringChange={setIncludeScoring}
+                onIncludeChartsChange={setIncludeCharts}
+                onIncludeHeroImagesChange={setIncludeHeroImages}
+                onIncludeSparklinesChange={setIncludeSparklines}
+                onPdfDesignOptionsChange={setPdfDesignOptions}
+                onHeroImagesManage={() => setHeroDialogOpen(true)}
+                onRegenerated={handleReportUpdate}
+                onDownload={handleDownload}
+              />
+
+              {hasOverrides && (
+                <InvestmentReportOverridePanel
+                  overriddenFields={overriddenFields}
+                  showOverrides={showOverrides}
+                  onShowOverridesChange={setShowOverrides}
+                />
+              )}
+            </aside>
+          </div>
+        </div>
+      </div>
+
+      <InvestmentReportMobileActionBar
+        onDownload={handleDownload}
+        onSendToClient={() => setSendToClientOpen(true)}
+        onCashFlow={() => navigate(`${CASH_FLOW_ANALYSIS_PATH}/${report.id}`)}
+        onEdit={() => setEditorOpen(true)}
+        onOverride={() => setOverrideModalOpen(true)}
+        onManageHeroImages={() => setHeroDialogOpen(true)}
+      />
+
+      {/* Editor Modal */}
+      <InvestmentReportEditor
+        report={report}
+        isOpen={editorOpen}
+        onClose={() => setEditorOpen(false)}
+        onSave={(updatedReport) => {
+          // Immutably update state so PDF generator receives fresh data
+          setReport(updatedReport);
+        }}
+      />
+
+      {/* Override Modal */}
+      <ManualDataOverrideModal
+        report={report}
+        isOpen={overrideModalOpen}
+        onClose={() => setOverrideModalOpen(false)}
+        onSave={handleReportUpdate}
+      />
+
+      {/* Send to Client Modal */}
+      <SendToClientModal
+        isOpen={sendToClientOpen}
+        onClose={() => setSendToClientOpen(false)}
+        reportId={report.id}
+        reportTitle={report.property_address}
+        reportTier={report.report_tier || undefined}
+        storagePath={report.pdf_url || null}
+        onGeneratePDF={async () => {
+          if (pdfGeneratorRef.current) {
+            const url = await pdfGeneratorRef.current.generateAndUpload();
+            if (url) {
+              setReport((prev) => prev ? { ...prev, pdf_url: url } : prev);
+            }
+            return url;
+          }
+          return null;
+        }}
+      />
+
+      <ReportVersionHistory
+        reportId={report.id}
+        currentVersion={report.current_version || 1}
+        open={versionHistoryOpen}
+        onOpenChange={setVersionHistoryOpen}
+        onVersionRestored={handleReportUpdate}
+      />
+
+      {/* Hero Image Studio */}
+      <HeroImageStudio
+        reportId={report.id}
+        open={heroDialogOpen}
+        onOpenChange={setHeroDialogOpen}
+      />
+    </div>
+  );
+}

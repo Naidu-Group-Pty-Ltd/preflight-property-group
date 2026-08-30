@@ -1,0 +1,383 @@
+import "https://deno.land/x/xhr@0.1.0/mod.ts";
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.39.0';
+import { internalError } from '../_shared/errorResponse.ts';
+import { parseJsonBody } from '../_shared/validate.ts';
+import { SchoolDataRequest, PUBLIC_SERVICE_MAX_BODY_BYTES } from '../_shared/publicServiceSchemas.ts';
+
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-correlation-id, x-step-up-token',
+  'Access-Control-Expose-Headers': 'x-correlation-id, x-tokens-used, x-tokens-reserved, x-tokens-estimated, x-duration-ms',
+};
+
+interface SchoolDataRequest {
+  suburb: string;
+  state: string;
+  postcode: string;
+  latitude?: number;
+  longitude?: number;
+}
+
+interface School {
+  name: string;
+  type: 'Government' | 'Catholic' | 'Independent' | 'Other';
+  level: 'Primary' | 'Secondary' | 'Combined' | 'Special' | 'Other';
+  address: string;
+  postcode: string;
+  icsea?: number;
+  studentCount?: number;
+  naplan?: any;
+  rating?: number;
+  distance?: number;
+  schoolId?: string;
+  websiteUrl?: string;
+}
+
+Deno.serve(async (req) => {
+  console.log('🏫 School Data service invoked');
+  
+  if (req.method === 'OPTIONS') {
+    return new Response(null, { headers: corsHeaders });
+  }
+
+  try {
+    // WP-24: bounded and shape-checked. This endpoint takes no session,
+    // so a bare req.json() read whatever was sent.
+    const __parsed = await parseJsonBody(req, SchoolDataRequest, corsHeaders, PUBLIC_SERVICE_MAX_BODY_BYTES);
+    if (!__parsed.ok) return __parsed.response;
+    const { suburb, state, postcode, latitude, longitude } = __parsed.data;
+    console.log('Fetching school data for:', suburb, state, postcode);
+
+    if (!suburb || !state || !postcode) {
+      return new Response(JSON.stringify({ 
+        success: false, 
+        error: 'Suburb, state, and postcode are required' 
+      }), {
+        status: 400,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+
+    // Initialize Supabase client
+    const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
+    const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
+    const supabase = createClient(supabaseUrl, supabaseKey);
+
+    // Fetch school data from database
+    const schoolData = await fetchSchoolDataFromDB(supabase, suburb, state, postcode, latitude, longitude);
+
+    return new Response(JSON.stringify({ 
+      success: true, 
+      data: schoolData 
+    }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+
+  } catch (error: any) {
+    console.error('❌ Error in School Data service:', error);
+    return new Response(JSON.stringify({
+      ...internalError(error, 'school-data-service'),
+      success: false,
+    }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  }
+});
+
+async function fetchSchoolDataFromDB(
+  supabase: any,
+  suburb: string, 
+  state: string, 
+  postcode: string,
+  latitude?: number,
+  longitude?: number
+) {
+  try {
+    console.log('🔍 Querying schools_directory database...');
+    
+    // Query schools from database by postcode and state
+    const { data: schools, error } = await supabase
+      .from('schools_directory')
+      .select('*')
+      .eq('postcode', postcode)
+      .eq('state', state.toUpperCase());
+
+    if (error) {
+      console.error('❌ Database query error:', error);
+      throw error;
+    }
+
+    if (schools && schools.length > 0) {
+      console.log(`✅ Found ${schools.length} schools in database`);
+      
+      // Calculate distances if coordinates provided
+      const schoolsWithDistance = schools.map((school: any) => ({
+        name: school.name,
+        type: school.school_type || 'Government',
+        level: school.school_level || 'Combined',
+        address: school.address || `${school.suburb}, ${state} ${postcode}`,
+        postcode: school.postcode,
+        icsea: school.icsea_score,
+        studentCount: school.student_count,
+        naplan: school.naplan_data,
+        rating: calculateSchoolRating(school.icsea_score, school.naplan_data),
+        distance: latitude && longitude && school.latitude && school.longitude
+          ? calculateDistance(latitude, longitude, school.latitude, school.longitude)
+          : undefined,
+        schoolId: school.id,
+        websiteUrl: school.website_url
+      }));
+
+      // Sort by distance if available, otherwise by rating
+      schoolsWithDistance.sort((a: typeof schoolsWithDistance[number], b: typeof schoolsWithDistance[number]) => {
+        if (a.distance !== undefined && b.distance !== undefined) {
+          return a.distance - b.distance;
+        }
+        return (b.rating || 0) - (a.rating || 0);
+      });
+
+      const summary = calculateSchoolSummary(schoolsWithDistance, postcode);
+      
+      return {
+        schools: schoolsWithDistance,
+        summary,
+        dataSource: 'Schools Directory Database (Cached)',
+        dataQuality: 'cached',
+        lastUpdated: new Date().toISOString(),
+        note: 'School data from local database. For latest information, visit myschool.edu.au'
+      };
+    }
+
+    console.log('⚠️ No schools found in database, attempting API fallback...');
+    
+    // Fallback: Try Google Places API if coordinates provided
+    if (latitude && longitude) {
+      const googleSchools = await fetchSchoolsFromGooglePlaces(latitude, longitude);
+      if (googleSchools.length > 0) {
+        console.log(`✅ Found ${googleSchools.length} schools from Google Places API`);
+        return {
+          schools: googleSchools,
+          summary: calculateSchoolSummary(googleSchools, postcode),
+          dataSource: 'Google Places API',
+          dataQuality: 'live',
+          lastUpdated: new Date().toISOString(),
+          note: 'School data from Google Places API. ICSEA scores and ratings not available.'
+        };
+      }
+    }
+
+    // Final fallback: Generate estimates
+    console.log('⚠️ Using estimated school data');
+    return generateSchoolEstimates(suburb, state, postcode);
+
+  } catch (error: any) {
+    console.error('❌ Error fetching school data:', error);
+    return generateSchoolEstimates(suburb, state, postcode);
+  }
+}
+
+async function fetchSchoolsFromGooglePlaces(latitude: number, longitude: number): Promise<School[]> {
+  try {
+    const googleApiKey = Deno.env.get('GOOGLE_MAPS_API_KEY');
+    if (!googleApiKey) {
+      console.log('⚠️ Google Maps API key not configured');
+      return [];
+    }
+
+    console.log('🔍 Fetching schools from Google Places API...');
+    
+    const radius = 5000; // 5km radius
+    const url = `https://maps.googleapis.com/maps/api/place/nearbysearch/json?location=${latitude},${longitude}&radius=${radius}&type=school&key=${googleApiKey}`;
+    
+    const response = await fetch(url);
+    
+    if (!response.ok) {
+      console.log(`⚠️ Google Places API returned status: ${response.status}`);
+      return [];
+    }
+
+    const data = await response.json();
+    
+    if (data.results && data.results.length > 0) {
+      return data.results.map((place: any) => ({
+        name: place.name,
+        type: 'Government' as const,
+        level: 'Combined' as const,
+        address: place.vicinity || '',
+        postcode: '',
+        rating: place.rating ? Math.min(5, place.rating) : 3,
+        distance: calculateDistance(
+          latitude,
+          longitude,
+          place.geometry.location.lat,
+          place.geometry.location.lng
+        ),
+        websiteUrl: place.website || undefined
+      }));
+    }
+
+    return [];
+  } catch (error) {
+    console.error('❌ Google Places API error:', error);
+    return [];
+  }
+}
+
+function calculateDistance(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  const R = 6371; // Earth's radius in km
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
+    Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return Math.round(R * c * 10) / 10;
+}
+
+function toRad(degrees: number): number {
+  return degrees * (Math.PI / 180);
+}
+
+function calculateSchoolRating(icsea: number | null, naplan: any): number {
+  if (!icsea && !naplan) return 3;
+  
+  let rating = 3;
+  
+  if (icsea) {
+    if (icsea >= 1150) rating = 5;
+    else if (icsea >= 1100) rating = 4.5;
+    else if (icsea >= 1050) rating = 4;
+    else if (icsea >= 1000) rating = 3.5;
+    else if (icsea >= 950) rating = 3;
+    else if (icsea >= 900) rating = 2.5;
+    else rating = 2;
+  }
+  
+  if (naplan?.overall) {
+    if (naplan.overall >= 450) rating = Math.min(5, rating + 0.5);
+    else if (naplan.overall <= 350) rating = Math.max(1, rating - 0.5);
+  }
+  
+  return Math.round(rating * 2) / 2;
+}
+
+function calculateSchoolSummary(schools: School[], postcode: string) {
+  if (!schools || schools.length === 0) {
+    return {
+      totalSchools: 0,
+      primarySchools: 0,
+      secondarySchools: 0,
+      averageICSEA: null,
+      averageRating: null,
+      topRatedSchools: [],
+      nearestSchool: null,
+      educationQuality: 'No school data available'
+    };
+  }
+  
+  const primarySchools = schools.filter(s => s.level === 'Primary' || s.level === 'Combined');
+  const secondarySchools = schools.filter(s => s.level === 'Secondary' || s.level === 'Combined');
+  
+  const icseaValues = schools.map(s => s.icsea).filter(i => i !== null && i !== undefined) as number[];
+  const averageICSEA = icseaValues.length > 0 
+    ? Math.round(icseaValues.reduce((a, b) => a + b, 0) / icseaValues.length)
+    : null;
+  
+  const ratings = schools.map(s => s.rating).filter(r => r !== null && r !== undefined) as number[];
+  const averageRating = ratings.length > 0
+    ? Math.round((ratings.reduce((a, b) => a + b, 0) / ratings.length) * 10) / 10
+    : null;
+  
+  const topRated = [...schools]
+    .filter(s => s.rating && s.rating >= 4)
+    .sort((a, b) => (b.rating || 0) - (a.rating || 0))
+    .slice(0, 5);
+  
+  const nearest = schools.length > 0 ? schools[0] : null;
+  
+  return {
+    totalSchools: schools.length,
+    primarySchools: primarySchools.length,
+    secondarySchools: secondarySchools.length,
+    averageICSEA,
+    averageRating,
+    topRatedSchools: topRated.map(s => ({
+      name: s.name,
+      rating: s.rating,
+      level: s.level,
+      type: s.type,
+      icsea: s.icsea
+    })),
+    nearestSchool: nearest ? {
+      name: nearest.name,
+      distance: nearest.distance || 'Unknown',
+      rating: nearest.rating,
+      level: nearest.level
+    } : null,
+    educationQuality: getEducationQualityDescription(averageICSEA, averageRating)
+  };
+}
+
+function getEducationQualityDescription(icsea: number | null, rating: number | null): string {
+  if (!icsea && !rating) return 'Education quality data unavailable';
+  
+  if (icsea && icsea >= 1100) {
+    return 'Excellent - This area has access to high-performing schools with well-above-average ICSEA scores.';
+  } else if (icsea && icsea >= 1000) {
+    return 'Very Good - Schools in this area perform above the national average.';
+  } else if (icsea && icsea >= 950) {
+    return 'Good - Schools in this area are close to the national average.';
+  } else if (rating && rating >= 4) {
+    return 'Good - Schools in this area are well-rated by the community.';
+  } else {
+    return 'Average - Schools in this area perform around the national average.';
+  }
+}
+
+function generateSchoolEstimates(suburb: string, state: string, postcode: string) {
+  console.log(`⚠️ Generating school estimates for ${suburb}, ${state} ${postcode}`);
+  
+  const postcodeNum = parseInt(postcode);
+  let baseICSEA = 1000;
+  
+  // Estimate ICSEA based on postcode patterns
+  const affluent = [2026, 2027, 2028, 2030, 3142, 3144, 3181, 6000, 6009];
+  if (affluent.includes(postcodeNum)) {
+    baseICSEA = 1150;
+  } else if (postcodeNum >= 2000 && postcodeNum < 2100) {
+    baseICSEA = 1050;
+  }
+
+  const schools: School[] = [
+    {
+      name: `${suburb} Public School`,
+      type: 'Government',
+      level: 'Primary',
+      address: `${suburb}, ${state} ${postcode}`,
+      postcode,
+      icsea: baseICSEA,
+      studentCount: 450,
+      rating: calculateSchoolRating(baseICSEA, null)
+    },
+    {
+      name: `${suburb} High School`,
+      type: 'Government',
+      level: 'Secondary',
+      address: `${suburb}, ${state} ${postcode}`,
+      postcode,
+      icsea: baseICSEA - 20,
+      studentCount: 850,
+      rating: calculateSchoolRating(baseICSEA - 20, null)
+    }
+  ];
+
+  return {
+    schools,
+    summary: calculateSchoolSummary(schools, postcode),
+    dataSource: `Estimated based on ${state} education patterns`,
+    dataQuality: 'estimated',
+    lastUpdated: new Date().toISOString(),
+    note: 'School data is estimated. For official information, visit myschool.edu.au and import real data.'
+  };
+}
