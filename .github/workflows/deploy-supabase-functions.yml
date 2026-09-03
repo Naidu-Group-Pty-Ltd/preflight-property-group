@@ -168,7 +168,7 @@ jobs:
         if: ${{ steps.changed.outputs.list != '' && steps.gate.outputs.ready == 'true' }}
         env:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
-          PROJECT_REF: ${{ vars.SUPABASE_PROJECT_REF || 'dduzbchuswwbefdunfct' }}
+          PROJECT_REF: ${{ vars.SUPABASE_PROJECT_REF }}
         run: |
           set -euo pipefail
           failed=''
@@ -245,7 +245,7 @@ jobs:
       - name: Verify the deployed CORS contract
         if: ${{ steps.changed.outputs.list != '' && steps.gate.outputs.ready == 'true' }}
         env:
-          PROJECT_REF: ${{ vars.SUPABASE_PROJECT_REF || 'dduzbchuswwbefdunfct' }}
+          PROJECT_REF: ${{ vars.SUPABASE_PROJECT_REF }}
           ORIGIN: ${{ vars.CORS_VERIFY_ORIGIN || 'https://command-centre.npcservices.com.au' }}
         run: |
           set -uo pipefail
