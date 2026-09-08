@@ -40,9 +40,13 @@
  */
 import { driveFileId, driveFolderId } from './drivePackage.pure.ts';
 import {
-  NO_DETERMINISTIC_IMAGE, type ProvenanceQuestion,
+  NO_DETERMINISTIC_IMAGE, negativeProvenanceStillStands,
+  type ProvenanceQuestion,
 } from './negativeProvenance.pure.ts';
-import { PACKAGE_RECOVERY_ATTEMPT, MAX_PACKAGE_ATTEMPTS } from './packageAttempt.pure.ts';
+import {
+  PACKAGE_RECOVERY_ATTEMPT, packageAttemptsExhausted,
+} from './packageAttempt.pure.ts';
+import { RUNTIME_VERSION } from './runtimeVersion.pure.ts';
 
 /** What a link can be asked for, decided by the URL alone. */
 export type BranchKind =
@@ -90,6 +94,61 @@ export function classifyBranch(url: string): BranchKind {
   return 'unsupported';
 }
 
+/**
+ * THE ADDRESS OF THE FILE, WHERE A HOST PUBLISHES A PREVIEW PAGE AT THE LINK.
+ *
+ * A shared-link host serves two different things at one address: a person
+ * opening it gets an interactive preview, and the file itself is behind a
+ * parameter the host publishes for exactly that purpose. Fetched without it,
+ * a brochure link answers 207 KB of `text/html` — the viewer APPLICATION —
+ * and the reader downstream does not fail, it succeeds at reading the wrong
+ * thing. Measured on the live Luxton source: every one of its thirteen
+ * brochures came back as Dropbox's preview page, and the PDF behind it is
+ * 6.2 MB.
+ *
+ * THIS IS NOT A USER-AGENT TRICK, and that was measured too. Dropbox serves
+ * the file to `curl/8.5.0` and the preview to `python-requests`, to
+ * `Mozilla/5.0`, to a Chrome string and to no user agent at all — so the only
+ * stable way through is the one the host documents, and dressing this client
+ * up as a browser would be both dishonest and unreliable.
+ *
+ * THREE RULES, and the first is what makes it safe to run on every retrieval:
+ *
+ *   ONLY A QUERY PARAMETER MOVES. The scheme, the host, the port and the path
+ *   are returned exactly as they arrived, so this cannot redirect a fetch
+ *   anywhere — the SSRF guard downstream is judging the same origin it would
+ *   have judged, and a test asserts it.
+ *
+ *   ONLY A HOST THAT PUBLISHES ONE. There is one entry below because one was
+ *   measured. A host added here without a retrieval that proves it is a guess
+ *   about somebody else's service, and the failure it produces is the silent
+ *   kind. Google Drive is absent because it never reaches here: a Drive link
+ *   classifies as `drive_file` or `drive_folder` and `driveDownloadUrl`
+ *   already addresses it.
+ *
+ *   AND IT IS IDEMPOTENT. A builder who pastes the download form of their own
+ *   link gets it back unchanged.
+ */
+export function sharedLinkFileUrl(rawUrl: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return rawUrl;
+  }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return rawUrl;
+
+  const host = parsed.hostname.toLowerCase().replace(/^www\./, '');
+  // Dropbox: `dl=1` is its own published way of asking for the file rather
+  // than the viewer. `dl=0` is what a "Copy link" button writes.
+  if (host === 'dropbox.com' || host === 'dropboxusercontent.com') {
+    if (parsed.searchParams.get('dl') === '1') return rawUrl;
+    parsed.searchParams.set('dl', '1');
+    return parsed.toString();
+  }
+  return rawUrl;
+}
+
 /** A branch this pipeline can actually try to take a photograph out of. */
 export function isTraversableBranch(branch: RowSourceBranch): boolean {
   return branch.kind !== 'unsupported';
@@ -127,6 +186,51 @@ export function rowSourceBranches(
     }
   }
   return branches;
+}
+
+/**
+ * THE ROW AS THE DOCUMENT STATES IT, PLUS THE TARGETS ONLY RECOVERY COULD SEE.
+ *
+ * A Google Sheet carries its documents as HYPERLINKS, and a sheet whose owner
+ * has turned off "viewers can download, print, copy" publishes no
+ * representation carrying a link target at all — every CSV of it shows the
+ * word `Brochure` and no address. The recovery reads those cells through an
+ * authorised connection and writes each row's own targets onto that row, so
+ * for such a document the stored row is the ONLY place the address exists.
+ *
+ * Re-reading the source stays right — a builder edits their sheet and those
+ * edits must land. But a re-read must not LOSE what the re-read can never
+ * contain, so the recovered columns are laid over the freshly parsed row: the
+ * document remains the authority on everything it can express, and the row is
+ * the authority on the one thing it cannot.
+ *
+ * Only columns the recovery NAMED are overlaid, and only where what it stored
+ * actually carries a link — so this can never invent a source, and a row that
+ * has had no recovery is returned exactly as the document stated it.
+ *
+ * Measured in production before this existed: 350 targets recovered onto 86
+ * properties, correctly attributed, and every one invisible to stage 1, which
+ * re-read the sheet, saw five labels and no addresses, and reported
+ * `stored 0, matched 0` for all eighty properties.
+ */
+export function unmappedWithRecoveredLinks(
+  unmapped: Record<string, string> | null | undefined,
+  storedRow: Record<string, unknown> | null | undefined,
+): Record<string, string> {
+  const base = { ...(unmapped ?? {}) };
+  const row = (storedRow ?? {}) as Record<string, unknown>;
+  const columns = Array.isArray(row.recovered_link_columns)
+    ? row.recovered_link_columns as unknown[] : [];
+  if (!columns.length) return base;
+
+  const stored = (row.unmapped ?? {}) as Record<string, unknown>;
+  for (const column of columns) {
+    if (typeof column !== 'string') continue;
+    const value = stored[column];
+    if (typeof value !== 'string' || !/https?:\/\//i.test(value)) continue;
+    base[column] = value;
+  }
+  return base;
 }
 
 // ---------------------------------------------------------------------------
@@ -189,8 +293,11 @@ export function branchQuestion(
   branch: RowSourceBranch,
   provenanceVersion: number,
   sourceAnchor: string | null,
+  runtimeVersion: number = RUNTIME_VERSION,
 ): ProvenanceQuestion {
-  return { provenanceVersion, packageReference: branch.url, sourceAnchor };
+  return {
+    provenanceVersion, packageReference: branch.url, sourceAnchor, runtimeVersion,
+  };
 }
 
 /**
@@ -201,8 +308,10 @@ export function branchQuestion(
  * nothing here can take a photograph out of it at all. Only the first two are
  * findings about the document.
  *
- * A branch whose record belongs to a DIFFERENT question — a bumped version, a
- * changed anchor — is not finished, because that record answers something else.
+ * A branch whose record belongs to a DIFFERENT question — a bumped extractor
+ * version, a changed anchor, or a retirement OUR OWN worker caused under a
+ * runtime that has since been superseded — is not finished, because that
+ * record answers something else.
  */
 export function branchTerminal(
   stored: unknown,
@@ -216,9 +325,20 @@ export function branchTerminal(
   if (Number(record.provenance_version) !== question.provenanceVersion) return false;
   if ((record.source_anchor ?? null) !== (question.sourceAnchor ?? null)) return false;
 
-  if (record.result === NO_DETERMINISTIC_IMAGE) return true;
+  /*
+   * BOTH TERMINAL ANSWERS ARE READ BY THE MODULE THAT WROTE THEM, and that is
+   * the whole of this fix. This function used to read `result` and `attempts`
+   * off the record itself, which meant it agreed with those two modules on
+   * every question except the one the runtime version exists to ask — so a
+   * runtime bump reopened a property's ROW while its branches stayed shut, and
+   * the settler claimed it, found nothing open, and re-settled it within the
+   * second. Delegating is what keeps the three predicates from drifting again.
+   */
+  if (record.result === NO_DETERMINISTIC_IMAGE) {
+    return negativeProvenanceStillStands(record, question);
+  }
   if (record.result === PACKAGE_RECOVERY_ATTEMPT) {
-    return Number(record.attempts ?? 0) >= MAX_PACKAGE_ATTEMPTS;
+    return packageAttemptsExhausted(record, question);
   }
   return false;
 }
@@ -237,9 +357,42 @@ export function openBranches(
   branches: RowSourceBranch[],
   provenanceVersion: number,
   sourceAnchor: string | null,
+  runtimeVersion: number = RUNTIME_VERSION,
 ): RowSourceBranch[] {
   return branches.filter((branch) => !branchTerminal(
-    stored, branch, branchQuestion(branch, provenanceVersion, sourceAnchor)));
+    stored, branch,
+    branchQuestion(branch, provenanceVersion, sourceAnchor, runtimeVersion)));
+}
+
+/**
+ * WHICH open branch this attempt takes.
+ *
+ * A run opens ONE branch: it downloads a multi-megabyte document and
+ * classifies its rasters, and that budget is what keeps a killed worker from
+ * pinning a whole upload. So the property comes back for the rest — and which
+ * one it takes next has to ADVANCE, or it never gets to the rest at all.
+ *
+ * Always taking the first open branch does not advance. An `unreachable`
+ * branch deliberately records nothing (a sign-in wall may open tomorrow, and
+ * banking "no image" for it would suppress a document that reads perfectly
+ * well), so it is open again on the next tick, and first again, for ever.
+ *
+ * PRODUCTION, 31 AUGUST 2026, upload `43ffa452`. Forty-nine properties sat on
+ * `source` across ten attempts each, answering in ~2.4 seconds with
+ * `progressed: false`. Each had answered its `Brochure V002` and `Estate
+ * Brochure` branches and had two more behind a `Siting  / Masterplan` link
+ * that could never answer — so those two were never asked once.
+ *
+ * Rotating on the property's own claim counter fixes it with no new state: the
+ * settler already increments it once per claim and resets it on a stage
+ * change, and every open branch therefore comes up within `open.length`
+ * attempts however any of them answers.
+ */
+export function branchForAttempt<T>(open: readonly T[], attempts: number): T | null {
+  if (!open.length) return null;
+  const n = Number(attempts);
+  const safe = Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+  return open[safe % open.length];
 }
 
 /**
@@ -254,6 +407,8 @@ export function allBranchesTerminal(
   branches: RowSourceBranch[],
   provenanceVersion: number,
   sourceAnchor: string | null,
+  runtimeVersion: number = RUNTIME_VERSION,
 ): boolean {
-  return openBranches(stored, branches, provenanceVersion, sourceAnchor).length === 0;
+  return openBranches(
+    stored, branches, provenanceVersion, sourceAnchor, runtimeVersion).length === 0;
 }

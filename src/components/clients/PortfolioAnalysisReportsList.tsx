@@ -12,6 +12,7 @@ import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
 import { ScrollArea } from '@/components/ui/scroll-area';
+import { SearchInput } from '@/components/ui/search-input';
 import {
   Table,
   TableBody,
@@ -56,6 +57,7 @@ import {
 } from 'lucide-react';
 import { format } from 'date-fns';
 import { toast } from 'sonner';
+import { PORTFOLIO_REPORT_LABEL } from '@/lib/reports/portfolio/label';
 
 interface PortfolioAnalysisReport {
   id: string;
@@ -96,10 +98,10 @@ const getHealthBadgeVariant = (health: string | null): 'default' | 'secondary' |
 
 const getHealthBadgeClassName = (health: string | null) => {
   switch (health?.toLowerCase()) {
-    case 'excellent': return 'border-success/45 bg-success/12 text-success-foreground ring-1 ring-inset ring-success/15 hover:bg-success/18';
-    case 'good': return 'border-success/45 bg-success/12 text-success-foreground ring-1 ring-inset ring-success/15 hover:bg-success/18';
+    case 'excellent': return 'border-success/45 bg-success/12 text-success ring-1 ring-inset ring-success/15 hover:bg-success/18';
+    case 'good': return 'border-success/45 bg-success/12 text-success ring-1 ring-inset ring-success/15 hover:bg-success/18';
     case 'fair': return 'border-brand-300/50 bg-brand-400/13 text-brand-100 ring-1 ring-inset ring-brand-200/15 hover:bg-brand-400/18';
-    case 'poor': return 'border-destructive/45 bg-destructive/13 text-destructive-foreground ring-1 ring-inset ring-destructive/15 hover:bg-destructive/18';
+    case 'poor': return 'border-destructive/45 bg-destructive/13 text-destructive ring-1 ring-inset ring-destructive/15 hover:bg-destructive/18';
     default: return 'border-border/30 bg-muted/40 text-foreground dark:text-foreground ring-1 ring-inset ring-border dark:ring-white/10 hover:bg-muted/60';
   }
 };
@@ -195,12 +197,25 @@ export function PortfolioAnalysisReportsList({ clientId, showHeader = true }: Po
     );
   });
 
-  // Summary stats
+  // Summary stats. Combined figures count each CLIENT once, at their most
+  // recent analysis — summing every report row counted the same portfolio
+  // once per report generated (five runs for one client inflated the
+  // combined value fivefold).
   const totalReports = reports.length;
-  const avgHealthScore = reports.length > 0
-    ? Math.round(reports.reduce((acc, r) => acc + (r.health_score || 0), 0) / reports.length)
+  const latestReportPerClient = (() => {
+    const byClient = new Map<string, PortfolioAnalysisReport>();
+    for (const report of reports) {
+      const existing = byClient.get(report.client_id);
+      if (!existing || new Date(report.created_at) > new Date(existing.created_at)) {
+        byClient.set(report.client_id, report);
+      }
+    }
+    return [...byClient.values()];
+  })();
+  const avgHealthScore = latestReportPerClient.length > 0
+    ? Math.round(latestReportPerClient.reduce((acc, r) => acc + (r.health_score || 0), 0) / latestReportPerClient.length)
     : 0;
-  const totalPortfolioValue = reports.reduce((acc, r) => acc + (Number(r.portfolio_value) || 0), 0);
+  const totalPortfolioValue = latestReportPerClient.reduce((acc, r) => acc + (Number(r.portfolio_value) || 0), 0);
   // Visual-only cue using the existing scorecard ranges; does not alter the average score calculation.
   const avgHealthAccent = avgHealthScore >= 80
     ? 'from-success to-success shadow-success/20'
@@ -260,8 +275,8 @@ export function PortfolioAnalysisReportsList({ clientId, showHeader = true }: Po
       } else {
         toast.success(
           result.reviewIncluded
-            ? 'Portfolio Performance Review ready, including the latest review'
-            : 'Portfolio Performance Review ready',
+            ? `${PORTFOLIO_REPORT_LABEL} ready, including the latest review`
+            : `${PORTFOLIO_REPORT_LABEL} ready`,
         );
       }
     } catch (e: any) {
@@ -334,7 +349,7 @@ export function PortfolioAnalysisReportsList({ clientId, showHeader = true }: Po
             variant="outline"
             size="sm"
             onClick={() => refetch()}
-            className="rounded-2xl border-destructive/25 bg-destructive/10 text-destructive-foreground transition-all hover:border-destructive/45 hover:bg-destructive/15 hover:text-destructive-foreground focus-visible:ring-2 focus-visible:ring-destructive/30 focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+            className="rounded-2xl border-destructive/25 bg-destructive/10 text-destructive transition-all hover:border-destructive/45 hover:bg-destructive/15 hover:text-destructive focus-visible:ring-2 focus-visible:ring-destructive/30 focus-visible:ring-offset-2 focus-visible:ring-offset-background"
           >
             <RefreshCw className={`mr-2 h-4 w-4 ${isRefetching ? 'animate-spin' : ''}`} />
             Retry
@@ -396,6 +411,9 @@ export function PortfolioAnalysisReportsList({ clientId, showHeader = true }: Po
               </CardHeader>
               <CardContent className="px-5 pb-5 pt-0">
                 <div className="min-w-0 whitespace-nowrap text-[clamp(1.875rem,2.6vw,2.625rem)] font-bold leading-none tracking-[-0.045em] text-brand-50">{formatCurrency(totalPortfolioValue)}</div>
+                <p className="mt-2 text-[11px] leading-4 text-brand-100/70">
+                  Latest analysis per client — earlier runs are not double-counted.
+                </p>
                 <div className="mt-4 h-px bg-gradient-to-r from-brand-200/80 via-brand-100/30 to-transparent" />
               </CardContent>
             </Card>
@@ -407,11 +425,12 @@ export function PortfolioAnalysisReportsList({ clientId, showHeader = true }: Po
               <div className="pointer-events-none absolute left-3.5 top-1/2 flex h-8 w-8 -translate-y-1/2 items-center justify-center rounded-xl border border-brand-300/15 bg-brand-300/10 text-brand-200/80">
                 <Search className="h-4 w-4" />
               </div>
-              <Input
+              <SearchInput
+                value={searchQuery}
+                onValueChange={setSearchQuery}
                 aria-label="Search portfolio reports by client name"
                 placeholder="Search by client name..."
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
+                hideIcon
                 className="h-12 rounded-2xl border-border dark:border-white/10 bg-background dark:bg-background/80 pl-14 pr-4 text-sm font-medium text-foreground dark:text-foreground shadow-inner shadow-sm dark:shadow-black/20 transition-all placeholder:text-muted-foreground hover:border-brand-300/25 focus-visible:border-brand-300/70 focus-visible:ring-2 focus-visible:ring-brand-300/30 focus-visible:ring-offset-2 focus-visible:ring-offset-background"
               />
             </div>
@@ -451,7 +470,7 @@ export function PortfolioAnalysisReportsList({ clientId, showHeader = true }: Po
               every row's typeset download reads it. */}
           <ReportTemplateSelector
             reportType="portfolio"
-            formatLabel="Portfolio Performance Review"
+            formatLabel={PORTFOLIO_REPORT_LABEL}
             className="mt-3"
           />
         </CardHeader>

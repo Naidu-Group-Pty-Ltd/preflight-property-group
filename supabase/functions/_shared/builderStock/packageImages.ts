@@ -33,11 +33,11 @@ import {
   type ScopedEntry,
   DRIVE_FOLDER_MIME, type DriveEntry,
 } from './drivePackage.pure.ts';
-import {
-  selectPdfPropertyPrimary, type PdfPhotoProvenance,
-} from './pdfSourcePhoto.ts';
+import { type PdfPhotoProvenance } from './pdfSourcePhoto.ts';
+import { runElection } from './pdfElectionClient.ts';
+import { classifyBranch, sharedLinkFileUrl } from './sourceBranches.pure.ts';
 import { readPdfPageTextResult } from './pdfText.ts';
-import { MAX_SOURCE_IMAGE_BYTES } from './sourceAssets.pure.ts';
+import { MAX_SOURCE_IMAGE_BYTES, sniffImageContentType } from './sourceAssets.pure.ts';
 import { PRIMARY_ROLE, type SourceImageRoleAssignment } from './sourceImageRole.pure.ts';
 
 /** Folder listings one repair run may read. Shared and cached across rows. */
@@ -133,17 +133,94 @@ export type PackageOutcome =
   | { status: 'unreachable'; detail: string };
 
 /**
+ * How long one branch's recovery may run before it is answered for.
+ *
+ * WHY A DEADLINE AT ALL, MEASURED 6 SEPTEMBER 2026. Lot 709 Verve's brochure
+ * elects in seconds through this exact pipeline on the same bytes, and in
+ * production the claim that started it died ~85 seconds in with no error, no
+ * kill status and no verdict — the isolate was simply shut down mid-item, and
+ * the standing attempt read as a destroyed worker. Every step in here is
+ * individually bounded (the fetch at 30 s total, the parse in single-digit
+ * seconds) and the SUM was not: a dynamic import that never settles, a
+ * response that stalls between chunks, a stream that neither ends nor errors
+ * — any of them holds the awaiting item past the tick budget, and what kills
+ * the worker then writes nothing down.
+ *
+ * 75 seconds: past every legitimate completion this pipeline has measured
+ * (the heaviest live document finishes in under ten), inside the ~90-second
+ * item budget, so the answer is written by US rather than by the reaper.
+ *
+ * A DEADLINE IS AN `unreachable`, NEVER AN INSPECTION. The document was not
+ * read to the end, so nothing may be banked against it — `unreachable`
+ * records nothing, retries on its own budget, and retires as a fact about
+ * our access. The racer's loser keeps running to no effect: this function
+ * writes nothing anywhere, so a late completion is a discarded value.
+ */
+export const RECOVERY_DEADLINE_MS = 75_000;
+
+async function withRecoveryDeadline(
+  work: Promise<PackageOutcome>,
+  ms: number,
+): Promise<PackageOutcome> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<PackageOutcome>((resolve) => {
+    timer = setTimeout(() => resolve({
+      status: 'unreachable',
+      detail: `The package could not be read inside ${Math.round(ms / 1000)} seconds, `
+        + 'so this attempt records nothing about the document.',
+    }), ms);
+  });
+  try {
+    return await Promise.race([work, expired]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
  * Find, fetch and extract the one image a row's own package document leads with.
  *
  * `label` is the row's own name — it carries both the lot and the house
  * design, and both have to appear on the document before it is accepted.
+ *
+ * The whole of it runs under `withRecoveryDeadline`, so a step that hangs
+ * becomes an answer the caller can record instead of a worker the platform
+ * reaps mid-claim.
  */
 export async function recoverPackageImage(
+  input: Parameters<typeof recoverPackageImageInner>[0],
+  deps: Parameters<typeof recoverPackageImageInner>[1] & { deadlineMs?: number } = {},
+): Promise<PackageOutcome> {
+  return await withRecoveryDeadline(
+    recoverPackageImageInner(input, deps),
+    deps.deadlineMs ?? RECOVERY_DEADLINE_MS,
+  );
+}
+
+async function recoverPackageImageInner(
   input: {
     packageUrl: string;
     label: string;
     /** The row's own building size, for telling two variants of one lot apart. */
     buildingSqm?: number | null;
+    /**
+     * The row's own house design, from the canonical `house_design` field.
+     *
+     * STRUCTURED, not parsed back out of `label`, for the reason `buildingSqm`
+     * is: a discriminator the row states is a fact, and re-deriving it from a
+     * display string is how the two come to disagree. A spreadsheet row carries
+     * no bracketed design for `lotAndDesignFrom` to find, which is why the one
+     * document that names the house was refused for not naming the lot.
+     */
+    design?: string | null;
+    /**
+     * The row's other identity names — its estate (`development_name`), its
+     * project — for the cover rule's corroboration test alone. The display
+     * label omits the estate whenever the row has a lot and a suburb, and the
+     * builder's own cover corroborates by the estate at least as often as by
+     * the suburb. See `pageStatesIdentity`, test 4.
+     */
+    identityHints?: string[] | null;
   },
   deps: {
     fetchPackage?: PackageFetcher;
@@ -175,18 +252,54 @@ export async function recoverPackageImage(
   } catch {
     return { status: 'not_identified', detail: 'The package link is not a web address.' };
   }
+
+  const labelParts = lotAndDesignFrom(input.label);
+  const lot = labelParts.lot;
+  /*
+   * The label's bracketed design where the label carries one, and the row's own
+   * canonical `house_design` otherwise. A spreadsheet row has no brackets, so
+   * before this the design was simply absent for every such row.
+   */
+  const design = labelParts.design ?? (String(input.design ?? '').trim() || null);
+
   if (!isGoogleDriveHost(host)) {
+    /*
+     * NOT DRIVE IS NOT UNREADABLE, and refusing here was banked as knowledge.
+     *
+     * PRODUCTION, 1 SEPTEMBER 2026. All thirteen brochures on the live stock
+     * list are Dropbox shared links — `…/Lot-709-Verve.pdf?rlkey=…&dl=0` —
+     * and every one was answered "That package is not on a source we can
+     * read" before anything was fetched, then recorded as a finished
+     * `no_deterministic_image`. Thirteen properties whose builder filed a
+     * correct brochure were told their package named no image, and the
+     * fallback ladder offered other companies' houses instead. Measured the
+     * same day: each of those links serves the actual PDF (5–8 MB, `%PDF-`)
+     * once asked for the file rather than the viewer, via the `dl=1`
+     * parameter Dropbox itself publishes (`sharedLinkFileUrl`).
+     *
+     * So a link whose URL names a DOCUMENT is fetched and read exactly as a
+     * Drive direct link is — same guarded fetcher, same PDF gate, same
+     * cover-identification rules, and `direct_link` evidence, because a row
+     * pointing at a file is not the file naming the property. Everything
+     * else keeps the refusal: a bare page, a portal, a folder on a host with
+     * no listing this pipeline can parse is still not a source we can read,
+     * and saying so remains a finding rather than an error.
+     */
+    if (classifyBranch(input.packageUrl) === 'document') {
+      return await extractFromDocument(
+        fetchPackage, readPageTexts, sharedLinkFileUrl(input.packageUrl),
+        documentNameFromUrl(input.packageUrl), input.label, 'direct_link', design,
+        input.identityHints);
+    }
     return { status: 'not_identified', detail: 'That package is not on a source we can read.' };
   }
-
-  const { lot, design } = lotAndDesignFrom(input.label);
 
   // A link straight to one document: the row named the file itself.
   const directFileId = driveFileId(input.packageUrl);
   if (directFileId) {
     return await extractFromDocument(
-      fetchPackage, readPageTexts, directFileId, 'the linked document', input.label,
-      'direct_link');
+      fetchPackage, readPageTexts, driveDownloadUrl(directFileId), 'the linked document',
+      input.label, 'direct_link', design, input.identityHints);
   }
 
   const rootId = driveFolderId(input.packageUrl);
@@ -268,8 +381,8 @@ export async function recoverPackageImage(
   }
 
   return await extractFromDocument(
-    fetchPackage, readPageTexts, document.id, document.name, input.label,
-    'folder_structure');
+    fetchPackage, readPageTexts, driveDownloadUrl(document.id), document.name, input.label,
+    'folder_structure', design, input.identityHints);
 }
 
 /**
@@ -451,11 +564,28 @@ async function takePhotographAsFiled(
   };
 }
 
+/** What the builder named the file, read from the link's own path. */
+function documentNameFromUrl(rawUrl: string): string {
+  try {
+    const last = new URL(rawUrl).pathname.split('/').filter(Boolean).pop() ?? '';
+    const name = decodeURIComponent(last).trim();
+    return name || 'the linked document';
+  } catch {
+    return 'the linked document';
+  }
+}
+
 async function extractFromDocument(
   fetchPackage: PackageFetcher,
   readPageTexts: (bytes: Uint8Array) => Promise<
     { ok: true; pages: string[] } | { ok: false; reason: string }>,
-  fileId: string,
+  /**
+   * The document's own address — a Drive download URL, or the FILE form of a
+   * shared link on an ordinary host. Built by the caller, because which host
+   * publishes which download parameter is the caller's knowledge, not this
+   * function's.
+   */
+  url: string,
   documentName: string,
   /** The property this package is supposed to be about. */
   label: string,
@@ -475,8 +605,13 @@ async function extractFromDocument(
    * their property in text like everything else.
    */
   identifiedBy: 'folder_structure' | 'direct_link',
+  /** The row's stated house design, for the design fallback. See
+   * `findDesignCoverPages`. */
+  design?: string | null,
+  /** The row's other identity names, for the cover rule's corroboration
+   * test alone. See `pageStatesIdentity`. */
+  identityHints?: readonly string[] | null,
 ): Promise<PackageOutcome> {
-  const url = driveDownloadUrl(fileId);
   let bytes: Uint8Array;
   try {
     ({ bytes } = await fetchPackage(url));
@@ -487,6 +622,45 @@ async function extractFromDocument(
     };
   }
 
+  /**
+   * NOT A PDF IS TWO DIFFERENT FACTS, AND CALLING BOTH `unreachable` STARVED
+   * THE BRANCHES BEHIND THEM.
+   *
+   * A share that really does need a login answers with a sign-in page, and
+   * `unreachable` is right for that: nothing was learned, nothing is written
+   * down, and the same link may read perfectly well tomorrow.
+   *
+   * A link to an IMAGE is not that. It downloaded, it is exactly what the
+   * builder filed, and there is nothing to come back for. But an `unreachable`
+   * branch records no verdict, so `openBranches` returns it again next tick and
+   * `openNow[0]` picks it again — for ever, with every branch behind it never
+   * once tried.
+   *
+   * PRODUCTION, 31 AUGUST 2026. Upload `43ffa452` reopened 80 properties with
+   * recovered links. Forty-nine of them stopped dead with `progressed: false`
+   * in ~2.4 seconds a tick, having answered their `Brochure V002` and `Estate
+   * Brochure` branches and never once reached the two behind them, because the
+   * next open branch was a `Siting  / Masterplan` link — Lot 117's is a 169 KB
+   * JPEG, Lot 607's a 29 KB WebP, both HTTP 200 — reported as "not publicly
+   * downloadable" on every one of ten attempts.
+   *
+   * So an image answers `not_identified`, which is a finding and is banked: the
+   * link was read, and a siting plan or masterplan filed as a bare image is not
+   * a package document and states no cover page for this property. It is NOT
+   * taken as the property's photograph — that is `takePhotographAsFiled`, and
+   * what licenses it is a folder named for the lot. A `direct_link` establishes
+   * nothing about WHICH property a file is about (one folder on the live list
+   * is shared by forty-four rows), so promoting a pointed-at image would be
+   * attribution by row position under another name.
+   */
+  if (bytes.length >= 5 && String.fromCharCode(...bytes.subarray(0, 5)) !== '%PDF-'
+    && sniffImageContentType(bytes)) {
+    return {
+      status: 'not_identified',
+      detail: 'That link is an image rather than a package document, so it presents no '
+        + 'page as this property\'s package cover.',
+    };
+  }
   // A share that actually needs a login answers with a sign-in page.
   if (bytes.length < 5 || String.fromCharCode(...bytes.subarray(0, 5)) !== '%PDF-') {
     return { status: 'unreachable', detail: 'That document is not publicly downloadable.' };
@@ -514,98 +688,21 @@ async function extractFromDocument(
    * recorded as a finding — and only a document that was actually read may
    * answer `not_identified`.
    */
-  const textResult = await readPageTexts(bytes);
-  if (!textResult.ok) {
-    return {
-      status: 'unreachable',
-      detail: `That document’s text could not be read (${"reason" in textResult ? textResult.reason : "unknown"}).`,
-    };
-  }
   /*
-   * And zero pages is the same fault wearing a different hat, whichever reader
-   * produced it: a PDF always has pages, so an empty list is the read failing
-   * rather than the document being silent. Judged here rather than inside one
-   * reader so every reader is held to it — the production one, and the ones
-   * tests inject to stand in for it.
+   * AND THE HEAVY HALF IS ONE NAMED UNIT NOW.
+   *
+   * Everything above is cheap and stays here: the fetch and its guarded
+   * fetcher, the `%PDF-` sniff, and the rule that a link to an IMAGE is not a
+   * package document. What follows — the text read and the election over the
+   * same bytes, inside one decode slot — is the one indivisible unit measured
+   * to exceed an Edge Function's 2,000 ms CPU limit, and it is
+   * `electFromPdfBytes`.
+   *
+   * The lift changed no behaviour: the same code, the same slot, the same
+   * winners. What it buys is that the unit can be RUN where there is CPU for
+   * it — see `electionRoute` for which of the two happens and why.
    */
-  if (!textResult.pages.length) {
-    return {
-      status: 'unreachable',
-      detail: 'That document\'s text could not be read (no pages came back).',
-    };
-  }
-  /*
-   * AND PAGES THAT CAME BACK EMPTY ARE THE SAME FAULT AGAIN.
-   *
-   * A package whose every page yields no text at all is not a package that says
-   * nothing about the property — it is a package this reader cannot read. The
-   * live list has them: "LOT 914 • COVELLA • GREENBANK QLD.pdf" is three pages
-   * of designed brochure exported as images, and its first page carries the
-   * lot, the estate, the suburb, the price, the land and house sizes and the
-   * facade render, all of it drawn rather than set. Text extraction returns
-   * zero characters from every page.
-   *
-   * Recording that as "the document names no image for this property" banks a
-   * finished negative produced by a reader that never read the document — and
-   * `negativeProvenanceStillStands` would then suppress the source until a
-   * version bump. So it is operational, and the property is asked again: the
-   * answer changes for free the day this can read a drawn page.
-   *
-   * PARTIAL emptiness is deliberately NOT this. A document with text on some
-   * pages was read; that it says nothing identifying on the others is a fact
-   * about the document.
-   */
-  const textFree = textResult.pages.every((text) => !String(text ?? '').trim());
-  if (textFree && identifiedBy !== 'folder_structure') {
-    return {
-      status: 'unreachable',
-      detail: 'That document\'s pages carry no extractable text, so it could not be read.',
-    };
-  }
-  const pageTexts = textResult.pages;
-  const selection = await selectPdfPropertyPrimary(bytes, {
-    label,
-    pageTexts,
-    // Supplied ONLY when the builder's folder already named this document for
-    // this one property and the document itself can say nothing. See
-    // `assignPdfMediaRoles`.
-    structuralCoverPage: textFree ? 1 : null,
+  return await runElection(bytes, readPageTexts, {
+    label, identifiedBy, design, identityHints, documentName, url,
   });
-  const photo = selection.primary;
-  if (!photo) {
-    /*
-     * A document nothing could be read from has still established nothing, even
-     * where its first page was structurally eligible and presented no single
-     * photograph. Recording a negative for it would bank an answer this reader
-     * never earned, so it stays operational and the property is asked again.
-     */
-    if (textFree) {
-      return {
-        status: 'unreachable',
-        detail: 'That document\'s pages carry no extractable text and its first page '
-          + 'presents no single photograph, so it could not be read.',
-      };
-    }
-    return {
-      status: 'not_identified',
-      detail: 'That document does not present a page as this property\'s package cover, '
-        + 'so it names no image for it.',
-    };
-  }
-
-  const suffix = photo.provenance.method === 'page_crop'
-    ? `crop(${photo.provenance.crop?.top}-${photo.provenance.crop?.bottom})`
-    : photo.provenance.resourceName;
-  return {
-    status: 'recovered',
-    image: {
-      bytes: photo.bytes,
-      contentType: photo.contentType,
-      reference: `${documentName}#page${photo.provenance.page}:${suffix}`,
-      documentName,
-      documentUrl: url,
-      provenance: photo.provenance,
-      role: photo.role,
-    },
-  };
 }

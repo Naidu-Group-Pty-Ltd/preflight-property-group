@@ -2,7 +2,7 @@
  * Builder stock lists — retrieving a source the builder linked to.
  *
  * THE SSRF CONTROL IS THE EXISTING ONE. `assertPublicUrl` and
- * `isPrivateOrReservedAddress` come from `import-from-url/ssrfGuard.ts` — the
+ * `isPrivateOrReservedAddress` come from `_shared/ssrfGuard.ts` — the
  * guard the link importer already uses, already covered by its own unit tests,
  * and already the place this deployment states which address space is
  * off-limits. A second implementation here would be a second thing to keep
@@ -16,7 +16,7 @@
  * portal session. The request carries a User-Agent and an Accept and nothing
  * else, and `credentials` never applies because nothing is attached to omit.
  */
-import { assertPublicUrl, type DnsRecordType } from '../../import-from-url/ssrfGuard.ts';
+import { assertPublicUrl, type DnsRecordType } from '../ssrfGuard.ts';
 
 /** One hop's wall clock. */
 const HOP_TIMEOUT_MS = 15_000;
@@ -47,8 +47,13 @@ import {
   type GoogleSheetsRef,
 } from './googleSheetsSource.pure.ts';
 import {
-  hyperlinkTargetOf, matchWorksheet, mergeHyperlinkColumns, type HyperlinkAvailability, type WorkbookSheet,
+  htmlViewSheetUrl, parseHtmlViewGrid,
+} from './googleSheetsHtmlGrid.pure.ts';
+import {
+  matchWorksheet, mergeHyperlinkColumns, type HyperlinkAvailability, type WorkbookSheet,
 } from './sheetHyperlinks.pure.ts';
+import { sharedLinkFileUrl } from './sourceBranches.pure.ts';
+import { readWorkbookSheets } from './workbookSheets.ts';
 import { parseDelimited } from './table.pure.ts';
 import { matrixToCsv } from './notionRecordMap.pure.ts';
 
@@ -63,6 +68,8 @@ export interface FetchedSource {
    * imagery. See `sourcesFullyEnumerable`.
    */
   hyperlinks?: HyperlinkAvailability;
+  /** Which public representation surrendered the link targets, when one did. */
+  hyperlinkMethod?: 'workbook_export' | 'htmlview';
   /** What the server said it was. A claim, checked against the bytes later. */
   declaredContentType: string;
   /** After redirects. This is what gets recorded as `final_url`. */
@@ -105,7 +112,16 @@ export async function fetchStockSource(startUrl: string): Promise<FetchedSource>
   const sheets = googleSheetsRef(startUrl);
   if (sheets) return await fetchGoogleSheet(sheets, startUrl);
 
-  return await fetchOrdinaryUrl(startUrl);
+  /*
+   * AND A SHARED-LINK HOST IS ASKED FOR THE FILE, for the same reason and in
+   * the same place. A Dropbox brochure link answers 207 KB of `text/html` —
+   * the viewer application — where the PDF behind it is 6.2 MB, and every one
+   * of the live Luxton source's thirteen brochures came back that way. See
+   * `sharedLinkFileUrl`: it moves a query parameter the host publishes and
+   * nothing else, so the address the SSRF guard judges is the address it would
+   * have judged.
+   */
+  return await fetchOrdinaryUrl(sharedLinkFileUrl(startUrl));
 }
 
 /**
@@ -155,7 +171,7 @@ async function fetchGoogleSheet(
       ref, attempt, body: decodeUtf8(body.bytes), sentinelBody,
     });
 
-    if (!resolved.ok) {
+    if (resolved.ok === false) {
       if (resolved.reason === 'gid_unresolved') {
         throw new SourceFetchError(
           'sheet_tab_not_found',
@@ -191,6 +207,7 @@ async function fetchGoogleSheet(
       finalUrl: attempt.url,
       status: body.status,
       hyperlinks: enriched.availability,
+      hyperlinkMethod: enriched.method,
     };
   }
 
@@ -212,34 +229,75 @@ async function fetchGoogleSheet(
 async function enrichWithHyperlinks(
   ref: GoogleSheetsRef,
   csv: string,
-): Promise<{ csv: string; availability: HyperlinkAvailability }> {
+): Promise<{
+  csv: string;
+  availability: HyperlinkAvailability;
+  /** Which public representation surrendered the targets, when one did. */
+  method?: 'workbook_export' | 'htmlview';
+}> {
   const matrix = parseDelimited(csv);
   if (matrix.length < 2) return { csv, availability: 'none_present' };
 
-  let workbookBytes: Uint8Array;
+  /*
+   * TWO PUBLIC SOURCES OF LINK TARGETS, TRIED IN ORDER, MERGED BY ONE RULE.
+   *
+   * The workbook export is first: it is the richest representation (every
+   * tab, HYPERLINK formulas, hidden columns included) and the one this
+   * pipeline has always read. But a document shared "anyone with the link can
+   * view" whose owner disabled download answers 401 to EVERY `export?format=…`
+   * while serving its rows over `gviz` — the live VG master list does exactly
+   * that — and this comment used to claim that only `/export` carries link
+   * targets. Measured on that document, that was wrong by one:
+   * `htmlview/sheet?gid=N` is a server-rendered grid of the VISIBLE tab
+   * carrying every anchor, and it honours the gid outright (an unknown gid is
+   * HTTP 400, not a substituted tab). See `googleSheetsHtmlGrid.pure.ts` for
+   * the full survey.
+   *
+   * WHAT DOES NOT VARY IS THE MERGE. Whichever source answered is converted
+   * to the same `WorkbookSheet` shape and goes through the same
+   * `matchWorksheet` / `alignWorksheetRows` / `mergeHyperlinkColumns` — the
+   * tab proven by content, every row proven by content, every target laid
+   * beside its own row. A link source that cannot pass those proofs lends
+   * nothing, whatever endpoint served it.
+   */
+  let sheets: WorkbookSheet[] | null = null;
+  let method: 'workbook_export' | 'htmlview' = 'workbook_export';
+  let workbookRefused: HyperlinkAvailability | null = null;
   try {
     // The workbook export carries no gid — it is the WHOLE document — which is
     // exactly why the worksheet is identified by content below.
     const fetched = await fetchOrdinaryUrl(
       `https://docs.google.com/spreadsheets/d/${ref.spreadsheetId}/export?format=xlsx`);
-    workbookBytes = fetched.bytes;
+    try {
+      sheets = await readWorkbookSheets(fetched.bytes);
+    } catch {
+      // We got the file and could not read it. A different fault, and a
+      // different remedy, from a document that refused to send it.
+      workbookRefused = 'unavailable_workbook_unreadable';
+    }
   } catch {
-    // The document would not hand over the workbook. Only `/export` carries
-    // link targets, so nothing is known about this sheet's links at all.
-    return { csv, availability: 'unavailable_source_export' };
+    workbookRefused = 'unavailable_source_export';
   }
 
-  let sheets: WorkbookSheet[];
-  try {
-    sheets = await readWorkbookSheets(workbookBytes);
-  } catch {
-    // We got the file and could not read it. A different fault, and a
-    // different remedy, from a document that refused to send it.
-    return { csv, availability: 'unavailable_workbook_unreadable' };
+  if (!sheets) {
+    try {
+      const page = await fetchOrdinaryUrl(htmlViewSheetUrl(ref.spreadsheetId, ref.gid));
+      const grid = parseHtmlViewGrid(decodeUtf8(page.bytes));
+      if (grid) {
+        sheets = [grid];
+        method = 'htmlview';
+      }
+    } catch {
+      // The grid was refused too. The workbook's refusal remains the answer.
+    }
+  }
+
+  if (!sheets) {
+    return { csv, availability: workbookRefused ?? 'unavailable_source_export' };
   }
 
   const match = matchWorksheet(matrix, sheets);
-  if (!match.ok) {
+  if (match.ok === false) {
     return {
       csv,
       availability: match.reason === 'ambiguous'
@@ -249,53 +307,9 @@ async function enrichWithHyperlinks(
   }
 
   const merged = mergeHyperlinkColumns(matrix, match.sheet);
-  if (!merged.linksResolved) return { csv, availability: 'none_present' };
+  if (!merged.linksResolved) return { csv, availability: 'none_present', method };
 
-  return { csv: matrixToCsv(merged.matrix), availability: 'resolved' };
-}
-
-/**
- * Every worksheet's visible values and its hyperlink targets.
- *
- * SheetJS surfaces a link as `cell.l.Target` beside the displayed `cell.v`, so
- * a labelled cell that carries no link is distinguishable from one that does
- * rather than inferred. The reader is the one this repository already loads
- * for spreadsheet sources; nothing new is introduced into the runtime.
- */
-async function readWorkbookSheets(bytes: Uint8Array): Promise<WorkbookSheet[]> {
-  const XLSX = await import('https://esm.sh/xlsx@0.18.5');
-  const workbook = XLSX.read(bytes, { type: 'array', cellDates: true });
-
-  return workbook.SheetNames.map((name: string) => {
-    const sheet = workbook.Sheets[name];
-    const values: (string | null)[][] = [];
-    const links: (string | null)[][] = [];
-    if (!sheet || !sheet['!ref']) return { name, values, links };
-
-    const range = XLSX.utils.decode_range(String(sheet['!ref']));
-    for (let r = range.s.r; r <= range.e.r; r += 1) {
-      const valueRow: (string | null)[] = [];
-      const linkRow: (string | null)[] = [];
-      for (let c = range.s.c; c <= range.e.c; c += 1) {
-        const cell = sheet[XLSX.utils.encode_cell({ r, c })];
-        valueRow.push(cell ? String(cell.w ?? cell.v ?? '') : null);
-        /*
-         * BOTH WAYS A CELL CAN POINT SOMEWHERE. `cell.l.Target` is the link
-         * RELATIONSHIP, which is what Insert > Link writes; a cell that IS
-         * `=HYPERLINK("…","Brochure")` carries no relationship at all and its
-         * target is an argument inside `cell.f`. Reading only the first
-         * dropped every brochure a builder typed as a formula.
-         */
-        linkRow.push(hyperlinkTargetOf({
-          link: cell?.l?.Target ?? null,
-          formula: cell?.f ?? null,
-        }));
-      }
-      values.push(valueRow);
-      links.push(linkRow);
-    }
-    return { name, values, links };
-  });
+  return { csv: matrixToCsv(merged.matrix), availability: 'resolved', method };
 }
 
 function decodeUtf8(bytes: Uint8Array): string {

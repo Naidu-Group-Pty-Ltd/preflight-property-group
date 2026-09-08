@@ -2,6 +2,7 @@ import { useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Download, FileText, Home, Loader2, Mail, Send, Calculator } from 'lucide-react';
 import { toast } from 'sonner';
+import { logReportRenderEvent } from '@/lib/reports/renderEvent';
 import { invokeSecureFunction } from '@/lib/secureInvoke';
 import { secureStorageUpload } from '@/hooks/useSecureStorage';
 import html2canvas from 'html2canvas';
@@ -232,7 +233,20 @@ interface ExpenseData {
 interface FormaraPDFGeneratorProps {
   data: FormaraPDFData;
   clientName: string;
-  onEmailClick?: (pdfBlob: Blob, fileName: string) => void;
+  /**
+   * Hand the produced PDF to a compose window.
+   *
+   * Audit item 12 — this menu item lives under "Send to Finance", and the
+   * compose window it opened was addressed to the CLIENT: their email in To,
+   * "Dear <client>" in the body, "Please find attached your updated portfolio
+   * documentation". Nothing carried who the mail was for, so the dialog fell
+   * back to the only party it knew about.
+   *
+   * The chosen finance partner travels with the document now. A caller that
+   * passes no recipient (the client-details download button) keeps the client
+   * defaults it has always had.
+   */
+  onEmailClick?: (pdfBlob: Blob, fileName: string, recipient?: FinanceReportRecipient) => void;
   onQuickSendComplete?: () => void;
   variant?: 'default' | 'outline' | 'ghost';
   size?: 'default' | 'sm' | 'lg';
@@ -377,6 +391,10 @@ export function FormaraPDFGenerator({
   const [includeOwnerOccupied, setIncludeOwnerOccupied] = useState(true);
   const [includeBorrowingCapacity, setIncludeBorrowingCapacity] = useState(false);
   const [financePickerOpen, setFinancePickerOpen] = useState(false);
+  // Which act the picker was opened for. Both go through the same dialog
+  // because both answer the same question — who at the finance partner — and
+  // two pickers is how two answers drift.
+  const [pickerIntent, setPickerIntent] = useState<'quick_send' | 'compose'>('quick_send');
   const { settings: brand } = useBrand();
 
   // Persist Formara PDF to storage + client_files in background
@@ -387,6 +405,7 @@ export function FormaraPDFGenerator({
       const uploadResult = await secureStorageUpload('client-files', storagePath, file, {
         contentType: 'application/pdf',
         upsert: true,
+        resourceId: clientIdVal,
       });
 
       if (uploadResult?.success) {
@@ -752,6 +771,7 @@ export function FormaraPDFGenerator({
         window.setTimeout(() => URL.revokeObjectURL(url), 0);
         persistFormaraPdf(pdfBlob, fileName, data.client.id);
         toast.success('Formara PDF downloaded & saved to Reports');
+        logReportRenderEvent({ format: 'client_details', engine: 'browser', source: 'formara_generator', reportId: data.client?.id ?? undefined, entityName: clientName });
         return null;
       }
     } catch (error) {
@@ -774,12 +794,12 @@ export function FormaraPDFGenerator({
     await generatePDF(false);
   };
 
-  const handleEmailSend = async () => {
+  const handleEmailSend = async (recipient?: FinanceReportRecipient) => {
     if (isDisabled) return;
     const pdfBlob = await generatePDF(true);
     if (pdfBlob && onEmailClick) {
       const fileName = `Formara_Form_${clientName.replace(/\s+/g, '_')}_${new Date().toISOString().replace(/[:.]/g, '-')}.pdf`;
-      onEmailClick(pdfBlob, fileName);
+      onEmailClick(pdfBlob, fileName, recipient);
     }
   };
 
@@ -845,7 +865,7 @@ export function FormaraPDFGenerator({
 
   if (action === 'download') {
     return (
-      <Button type="button" variant="outline" size={size} onClick={handleDownload} disabled={isDisabled} title="Download the current client details as a PDF">
+      <Button type="button" variant={variant === 'default' ? 'outline' : variant} size={size} onClick={handleDownload} disabled={isDisabled} title="Download the current client details as a PDF (legacy raster layout)">
         {isGenerating ? <Loader2 className="h-4 w-4 mr-1.5 animate-spin" /> : <Download className="h-4 w-4 mr-1.5" />}
         {isGenerating ? 'Downloading…' : buttonLabel}
       </Button>
@@ -901,7 +921,15 @@ export function FormaraPDFGenerator({
         {onEmailClick && (
           <>
             <DropdownMenuSeparator />
-            <DropdownMenuItem onSelect={() => { void handleEmailSend(); }} disabled={isDisabled}>
+            {/* Audit item 12: asks WHO before composing, through the picker
+                that "Quick Send" already uses. It used to compose straight
+                away, and the only party the dialog knew about was the client
+                — so a menu item under "Send to Finance" produced an email to
+                the customer. */}
+            <DropdownMenuItem
+              onSelect={(e) => { e.preventDefault(); setPickerIntent('compose'); setFinancePickerOpen(true); }}
+              disabled={isDisabled}
+            >
               <Mail className="h-4 w-4 mr-2" />
               Compose Email with PDF
             </DropdownMenuItem>
@@ -910,7 +938,7 @@ export function FormaraPDFGenerator({
                 indication that most of them cannot receive this client's
                 report — and collapsed to a person's name when there was one. */}
             <DropdownMenuItem
-              onSelect={(e) => { e.preventDefault(); setFinancePickerOpen(true); }}
+              onSelect={(e) => { e.preventDefault(); setPickerIntent('quick_send'); setFinancePickerOpen(true); }}
               disabled={isDisabled}
             >
               <Send className="h-4 w-4 mr-2" />
@@ -929,8 +957,16 @@ export function FormaraPDFGenerator({
       clientId={data.client.id}
       clientName={clientName}
       documentLabel="this client details report"
+      deliveryMode={pickerIntent === 'compose' ? 'email' : 'portal'}
       busy={isSending}
-      onConfirm={(recipient) => { void handleQuickSend(recipient); }}
+      onConfirm={(recipient) => {
+        if (pickerIntent === 'compose') {
+          setFinancePickerOpen(false);
+          void handleEmailSend(recipient);
+          return;
+        }
+        void handleQuickSend(recipient);
+      }}
     />
     </>
   );

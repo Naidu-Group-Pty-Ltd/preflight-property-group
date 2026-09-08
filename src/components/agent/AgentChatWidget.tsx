@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
-import { MessageSquare, X, Plus, Trash2, Send, Check, XCircle, Loader2, ChevronLeft, Search, Pencil, RotateCcw, Sparkles, Diamond, BarChart3, Calendar, Zap, TrendingUp, Target, FileDown, Brain, Bell, Settings, Users, Share2, ClipboardList, Clock, Shield, ChevronRight, Info, Play, HelpCircle, ArrowRight, Paperclip, File, Image as ImageIcon, Square } from 'lucide-react';
+import { MessageSquare, X, Plus, Trash2, Send, Check, XCircle, Loader2, ChevronLeft, Pencil, RotateCcw, Sparkles, Diamond, BarChart3, Calendar, Zap, TrendingUp, Target, FileDown, Brain, Bell, Settings, Users, Share2, ClipboardList, Clock, Shield, ChevronRight, Info, Play, HelpCircle, ArrowRight, Paperclip, File, Image as ImageIcon, Square } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { InternalMessagesPanel } from '@/components/agent/InternalMessagesPanel';
 import { OPEN_INTERNAL_MESSAGES_EVENT, onInternalMessage, setInternalMessagesPanelOpen } from '@/lib/internalMessagingBus';
@@ -9,6 +9,7 @@ import { Textarea } from '@/components/ui/textarea';
 import { Input } from '@/components/ui/input';
 import { cn } from '@/lib/utils';
 import { VoiceToTextButton } from '@/components/ui/VoiceToTextButton';
+import { SearchInput } from '@/components/ui/search-input';
 import { invokeSecureFunction } from '@/lib/secureInvoke';
 import { streamSecureFunction } from '@/lib/streamSecureFunction';
 import { logActivityDirect } from '@/hooks/useActivityLogger';
@@ -506,7 +507,13 @@ export function AgentChatWidget() {
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
         const storagePath = `agent-uploads/${user.id}/${timestamp}-${file.name}`;
         try {
-          await secureStorageUpload('client-files', storagePath, file, { upsert: true });
+          // Bound to the conversation this attachment belongs to. `secure-storage`
+          // derives ownership from an authoritative row, and an agent
+          // attachment belongs to a chat rather than to any client.
+          await secureStorageUpload('client-files', storagePath, file, {
+            upsert: true,
+            resourceId: finalConvId,
+          });
           // Index in DB
           await invokeSecureFunction('ai-dashboard-agent', {
             action: 'index-file-upload',
@@ -1105,10 +1112,13 @@ export function AgentChatWidget() {
           <div className="w-full flex flex-col bg-muted/20">
             {/* Search */}
             <div className="px-3 py-2 border-b">
-              <div className="relative">
-                <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
-                <Input value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} placeholder="Search conversations..." className="h-8 pl-8 text-xs" />
-              </div>
+              <SearchInput
+                value={searchQuery}
+                onValueChange={setSearchQuery}
+                placeholder="Search conversations..."
+                className="h-8 text-xs"
+                iconClassName="left-2.5 h-3.5 w-3.5"
+              />
             </div>
 
             {/* Tabs */}

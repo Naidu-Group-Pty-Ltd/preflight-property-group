@@ -53,7 +53,9 @@ import {
   User,
   MoreHorizontal,
   SlidersHorizontal,
-  Target
+  Target,
+  X,
+  Star
 } from 'lucide-react';
 import { ActiveClientCard } from '@/components/clients/ActiveClientCard';
 // Pagination imports removed - using infinite scroll now
@@ -496,18 +498,87 @@ export default function ClientTracker() {
 
       return { localOnly: true };
     },
+    // Optimistic move: the card's column comes from the cached
+    // ghl_client_opportunities rows (not clients.current_stage_id), so both
+    // caches are patched before the server round-trip or the card sits in the
+    // old column until the next 5-minute pipeline sync.
+    onMutate: async ({ clientId, stageId, stageName }) => {
+      await Promise.all([
+        queryClient.cancelQueries({ queryKey: ['ghl-client-opportunities'] }),
+        queryClient.cancelQueries({ queryKey: ['client-tracker'] }),
+      ]);
+      const previousOpportunities = queryClient.getQueryData<ClientOpportunity[]>(['ghl-client-opportunities']);
+      const previousClients = queryClient.getQueryData<TrackedClient[]>(['client-tracker']);
+      queryClient.setQueryData<ClientOpportunity[]>(['ghl-client-opportunities'], (old) =>
+        (old ?? []).map((opp) =>
+          opp.client_id === clientId ? { ...opp, stage_id: stageId, stage_name: stageName } : opp
+        )
+      );
+      queryClient.setQueryData<TrackedClient[]>(['client-tracker'], (old) =>
+        (old ?? []).map((client) =>
+          client.id === clientId
+            ? { ...client, current_stage_id: stageId, pipeline_status: stageName }
+            : client
+        )
+      );
+      return { previousOpportunities, previousClients };
+    },
     onSuccess: (result) => {
       queryClient.invalidateQueries({ queryKey: ['client-tracker'] });
       queryClient.invalidateQueries({ queryKey: ['clients'] });
+      queryClient.invalidateQueries({ queryKey: ['ghl-client-opportunities'] });
       if (result?.ghlSynced) {
         toast.success(`Moved to ${result.stage} (synced to GHL)`);
       }
     },
-    onError: (error) => {
-      // Refetch to restore correct state
+    onError: (error, _variables, context) => {
+      // Restore the pre-move snapshots, then refetch the truth
+      if (context?.previousOpportunities) {
+        queryClient.setQueryData(['ghl-client-opportunities'], context.previousOpportunities);
+      }
+      if (context?.previousClients) {
+        queryClient.setQueryData(['client-tracker'], context.previousClients);
+      }
       queryClient.invalidateQueries({ queryKey: ['client-tracker'] });
       queryClient.invalidateQueries({ queryKey: ['clients'] });
+      queryClient.invalidateQueries({ queryKey: ['ghl-client-opportunities'] });
       toast.error(`Failed to move client: ${error.message}`);
+    },
+  });
+
+  // Star a client as active/favorite straight from the board — the same
+  // write ActiveClientCard performs, optimistic so the star answers the click.
+  const toggleFavoriteMutation = useMutation({
+    mutationFn: async ({ clientId, isFavorite }: { clientId: string; isFavorite: boolean }) => {
+      const { data, error } = await invokeSecureFunction('manage-client-data', {
+        operation: 'update',
+        table: 'clients',
+        clientId,
+        data: { is_favorite: isFavorite },
+      });
+      if (error || !data?.success) throw new Error(data?.error || error?.message || 'Failed to update client');
+      return { isFavorite };
+    },
+    onMutate: async ({ clientId, isFavorite }) => {
+      await queryClient.cancelQueries({ queryKey: ['client-tracker'] });
+      const previousClients = queryClient.getQueryData<TrackedClient[]>(['client-tracker']);
+      queryClient.setQueryData<TrackedClient[]>(['client-tracker'], (old) =>
+        (old ?? []).map((client) =>
+          client.id === clientId ? { ...client, is_favorite: isFavorite } : client
+        )
+      );
+      return { previousClients };
+    },
+    onSuccess: (result) => {
+      queryClient.invalidateQueries({ queryKey: ['client-tracker'] });
+      queryClient.invalidateQueries({ queryKey: ['clients'] });
+      toast.success(result.isFavorite ? 'Added to active clients' : 'Removed from active clients');
+    },
+    onError: (error, _variables, context) => {
+      if (context?.previousClients) {
+        queryClient.setQueryData(['client-tracker'], context.previousClients);
+      }
+      toast.error(`Failed to update active clients: ${error.message}`);
     },
   });
 
@@ -1039,7 +1110,7 @@ export default function ClientTracker() {
             </div>
           </CardHeader>
           <CardContent className="pt-0">
-            <ScrollArea className="w-full">
+            <ScrollArea horizontal className="w-full">
               <div className="flex gap-3 pb-2">
                 {upcomingAppointments.map(event => (
                   <Card 
@@ -1133,8 +1204,18 @@ export default function ClientTracker() {
               aria-label="Search clients"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              className="client-tracker-gold-interaction h-11 rounded-xl border-border/70 bg-background/85 pl-10 pr-4 text-sm shadow-inner transition-all placeholder:text-muted-foreground/70 hover:border-primary/30 hover:bg-background/95 focus-visible:border-primary/55 focus-visible:ring-2 focus-visible:ring-primary/30"
+              className="client-tracker-gold-interaction h-11 rounded-xl border-border/70 bg-background/85 pl-10 pr-10 text-sm shadow-inner transition-all placeholder:text-muted-foreground/70 hover:border-primary/30 hover:bg-background/95 focus-visible:border-primary/55 focus-visible:ring-2 focus-visible:ring-primary/30"
             />
+            {searchQuery && (
+              <button
+                type="button"
+                onClick={() => setSearchQuery('')}
+                aria-label="Clear client search"
+                className="absolute right-2 top-1/2 flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-primary/10 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            )}
           </div>
           
           {/* Mobile: Filters in Sheet */}
@@ -1322,7 +1403,7 @@ export default function ClientTracker() {
             )}
             
             <div className="rounded-[1.5rem] border border-border/70 bg-[radial-gradient(circle_at_top_left,hsl(var(--primary)/0.10),transparent_24rem),linear-gradient(135deg,hsl(var(--background)/0.72),hsl(var(--card)/0.62))] p-3 shadow-inner shadow-sm dark:shadow-black/20">
-              <ScrollArea className="client-tracker-kanban-scroll w-full whitespace-nowrap rounded-[1.15rem]" aria-label="Kanban board stages">
+              <ScrollArea horizontal className="client-tracker-kanban-scroll w-full whitespace-nowrap rounded-[1.15rem]" aria-label="Kanban board stages">
                 <div className="flex gap-4 pb-5 pr-3 sm:gap-5">
                 {/* Render stages in order */}
                 {stagesForPipeline.map(stage => {
@@ -1389,6 +1470,7 @@ export default function ClientTracker() {
                                   isDragging={draggedClient?.id === client.id}
                                   upcomingAppointment={clientAppointmentMap[client.id]}
                                   opportunities={clientOpportunitiesMap[client.id]}
+                                  onToggleFavorite={canEditTracker ? () => toggleFavoriteMutation.mutate({ clientId: client.id, isFavorite: !client.is_favorite }) : undefined}
                                 />
                               ))
                             )}
@@ -1456,6 +1538,7 @@ export default function ClientTracker() {
                                 isDragging={draggedClient?.id === client.id}
                                 upcomingAppointment={clientAppointmentMap[client.id]}
                                 opportunities={clientOpportunitiesMap[client.id]}
+                                onToggleFavorite={canEditTracker ? () => toggleFavoriteMutation.mutate({ clientId: client.id, isFavorite: !client.is_favorite }) : undefined}
                               />
                             ))
                           )}
@@ -1521,7 +1604,7 @@ export default function ClientTracker() {
                                   {stageInfo.name}
                                 </Badge>
                                 {isOverdue && (
-                                  <Badge variant="destructive" className={cn(badgeBaseClass, "bg-destructive/15 text-destructive-foreground shadow-destructive/15")}>Overdue</Badge>
+                                  <Badge variant="destructive" className={cn(badgeBaseClass, "bg-destructive/15 text-destructive shadow-destructive/15")}>Overdue</Badge>
                                 )}
                               </div>
                               <div className="mt-2 flex flex-wrap items-center gap-3 text-sm text-muted-foreground">
@@ -1541,7 +1624,7 @@ export default function ClientTracker() {
                               {client.follow_up_date && (
                                 <div className="mt-2 flex items-center gap-1.5 text-sm">
                                   <CalendarIcon className="h-3 w-3 shrink-0" />
-                                  <span className={isOverdue ? 'text-destructive-foreground0' : 'text-muted-foreground'}>
+                                  <span className={isOverdue ? 'text-destructive' : 'text-muted-foreground'}>
                                     Follow-up: {format(new Date(client.follow_up_date), 'MMM d, yyyy')}
                                   </span>
                                 </div>
@@ -1549,13 +1632,13 @@ export default function ClientTracker() {
                               {(client.borrowing_capacity || client.equity_release) && (
                                 <div className="flex items-center gap-4 mt-2 text-sm">
                                   {client.borrowing_capacity && (
-                                    <span className="flex items-center gap-1 rounded-full border border-success/20 bg-success/10 px-2 py-0.5 font-semibold text-success-foreground0">
+                                    <span className="flex items-center gap-1 rounded-full border border-success/20 bg-success/10 px-2 py-0.5 font-semibold text-success">
                                       <DollarSign className="h-3 w-3" />
                                       BC: {formatCurrency(client.borrowing_capacity)}
                                     </span>
                                   )}
                                   {client.equity_release && (
-                                    <span className="rounded-full border border-info/20 bg-info/10 px-2 py-0.5 font-semibold text-info-foreground0">
+                                    <span className="rounded-full border border-info/20 bg-info/10 px-2 py-0.5 font-semibold text-info">
                                       Equity: {formatCurrency(client.equity_release)}
                                     </span>
                                   )}
@@ -1693,14 +1776,14 @@ export default function ClientTracker() {
                               : <span className="text-muted-foreground/55">-</span>
                             }
                           </TableCell>
-                          <TableCell className={cn("whitespace-nowrap text-right text-sm font-semibold tabular-nums", client.borrowing_capacity ? "text-success-foreground0" : "text-muted-foreground/55")}>{formatCurrency(client.borrowing_capacity)}</TableCell>
+                          <TableCell className={cn("whitespace-nowrap text-right text-sm font-semibold tabular-nums", client.borrowing_capacity ? "text-success" : "text-muted-foreground/55")}>{formatCurrency(client.borrowing_capacity)}</TableCell>
                           <TableCell className="whitespace-nowrap text-right text-sm tabular-nums">
                             {client.proposed_rental_income 
-                              ? <span className="font-semibold text-success-foreground0">${client.proposed_rental_income}/wk</span>
+                              ? <span className="font-semibold text-success">${client.proposed_rental_income}/wk</span>
                               : <span className="text-muted-foreground/55">-</span>
                             }
                           </TableCell>
-                          <TableCell className={cn("whitespace-nowrap text-right text-sm font-semibold tabular-nums", client.equity_release ? "text-success-foreground0" : "text-muted-foreground/55")}>{formatCurrency(client.equity_release)}</TableCell>
+                          <TableCell className={cn("whitespace-nowrap text-right text-sm font-semibold tabular-nums", client.equity_release ? "text-success" : "text-muted-foreground/55")}>{formatCurrency(client.equity_release)}</TableCell>
                           <TableCell className="text-right">
                             <Dialog>
                               <DialogTrigger asChild>
@@ -1891,18 +1974,20 @@ interface KanbanCardProps {
   isDragging?: boolean;
   upcomingAppointment?: GHLEvent | null;
   opportunities?: ClientOpportunity[];
+  onToggleFavorite?: () => void;
 }
 
-function KanbanCard({ 
-  client, 
-  formatCurrency, 
-  onEdit, 
+function KanbanCard({
+  client,
+  formatCurrency,
+  onEdit,
   isDraggable = false,
   onDragStart,
   onDragEnd,
   isDragging = false,
   upcomingAppointment,
   opportunities = [],
+  onToggleFavorite,
 }: KanbanCardProps) {
   const isOverdue = client.follow_up_date && new Date(client.follow_up_date) < new Date();
   const otherPipelines = opportunities.filter(o => o.pipeline_name).map(o => o.pipeline_name);
@@ -1943,14 +2028,36 @@ function KanbanCard({
         </div>
         <div className="flex items-center gap-1 flex-shrink-0">
           {isOverdue && (
-            <Badge variant="destructive" className={cn(compactBadgeBaseClass, "bg-destructive/15 text-destructive-foreground shadow-destructive/15")}>
+            <Badge variant="destructive" className={cn(compactBadgeBaseClass, "bg-destructive/15 text-destructive shadow-destructive/15")}>
               Overdue
             </Badge>
           )}
           {client.deal_status === 'closed' && (
-            <Badge variant="default" className={cn(compactBadgeBaseClass, "bg-success/15 text-success-foreground shadow-success/15")}>
+            <Badge variant="default" className={cn(compactBadgeBaseClass, "bg-success/15 text-success shadow-success/15")}>
               🏆
             </Badge>
+          )}
+          {onToggleFavorite && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                onToggleFavorite();
+              }}
+              onKeyDown={(e) => e.stopPropagation()}
+              draggable={false}
+              aria-label={client.is_favorite ? 'Remove from active clients' : 'Add to active clients'}
+              aria-pressed={!!client.is_favorite}
+              title={client.is_favorite ? 'Remove from active clients' : 'Add to active clients'}
+              className={cn(
+                'flex h-6 w-6 items-center justify-center rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40',
+                client.is_favorite
+                  ? 'text-primary hover:bg-primary/10'
+                  : 'text-muted-foreground/60 hover:bg-primary/10 hover:text-primary'
+              )}
+            >
+              <Star className={cn('h-3.5 w-3.5', client.is_favorite && 'fill-current')} />
+            </button>
           )}
         </div>
       </div>
@@ -1999,7 +2106,7 @@ function KanbanCard({
         {client.follow_up_date && (
           <p className={cn(
             "flex items-center gap-1 rounded-full border border-border/60 bg-background/60 px-2 py-0.5 text-xs font-medium",
-            isOverdue ? 'text-destructive-foreground0' : 'text-muted-foreground'
+            isOverdue ? 'text-destructive' : 'text-muted-foreground'
           )}>
             <CalendarIcon className="h-3 w-3 shrink-0" />
             {format(new Date(client.follow_up_date), 'MMM d')}

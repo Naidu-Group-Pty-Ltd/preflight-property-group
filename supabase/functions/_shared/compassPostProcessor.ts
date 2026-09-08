@@ -41,6 +41,7 @@ import {
   PROTECTED_SECTION_IDS,
   type CompassSectionDefinition,
 } from './compassSectionRegistry.ts';
+import { scrubBlocks } from './reports/investment/blockHygiene.pure.ts';
 
 export type PostProcessTier = 'compass-40' | 'financial-analysis';
 
@@ -62,6 +63,15 @@ export interface PostProcessReport {
    */
   editorialBlocksRemoved: number;
   editorialWordsRemoved: number;
+  /**
+   * Stat cards dropped for stating nothing, and charts dropped as repeats.
+   *
+   * Counted for the same reason as `editorialBlocksRemoved`: a report that
+   * never had an empty card and one this pass cleaned look identical
+   * afterwards, and only the count tells them apart.
+   */
+  emptyStatCardsRemoved: number;
+  duplicateDirectivesRemoved: number;
 }
 
 interface ParsedSection {
@@ -187,27 +197,70 @@ function truncateNarrativeToCap(bodyLines: string[], cap: number): { lines: stri
   const words = original.split(/\s+/).filter(Boolean);
   if (words.length <= cap) return { lines: bodyLines, removed: 0 };
 
-  // Keep tables, lists, headings and figures intact; truncate prose from the end.
+  // Truncate cleanly or not at all. The first version kept every structural
+  // line after the budget ran out and cut the last paragraph mid-clause with
+  // a literal '…' — which shipped pages of headings with nothing under them
+  // and eight sentences ending mid-thought, measured on a real client
+  // document. Now: once the budget is spent, NOTHING further is kept —
+  // structure included — a paragraph that does not fit whole is dropped
+  // whole, and any headings left dangling at the tail (their content was cut)
+  // are dropped with what they promised. Figures and tables still never cut a
+  // line in half: they are structural, so they either fit before the budget
+  // ends or go with everything after it.
   const out: string[] = [];
   let budget = cap;
   let removed = 0;
+  let spent = false;
+
+  // After the budget is spent, DATA still survives: a chart directive or a
+  // table row is a figure, and the standing rule is that a label is stripped
+  // with its paragraph but never a figure or a table. A heading survives the
+  // cut only as the label of data that follows it — buffered until the next
+  // kept line says which it is.
+  const isData = (t: string) => t.startsWith('{{') || t.startsWith('|');
+  let pendingHeading: string | null = null;
 
   for (const line of bodyLines) {
-    if (isStructuralLine(line)) {
+    const t = line.trim();
+    const w = line.split(/\s+/).filter(Boolean);
+    if (!spent) {
+      if (isStructuralLine(line)) { out.push(line); continue; }
+      if (w.length <= budget) {
+        out.push(line);
+        budget -= w.length;
+        if (budget <= 0) spent = true;
+      } else {
+        removed += w.length;
+        spent = true;
+      }
+      continue;
+    }
+    if (t === '') { out.push(line); continue; }
+    if (t.startsWith('#')) {
+      if (pendingHeading) removed += pendingHeading.split(/\s+/).filter(Boolean).length;
+      pendingHeading = line;
+      continue;
+    }
+    if (isData(t)) {
+      if (pendingHeading) { out.push(pendingHeading); pendingHeading = null; }
       out.push(line);
       continue;
     }
-    const w = line.split(/\s+/).filter(Boolean);
-    if (w.length <= budget) {
-      out.push(line);
-      budget -= w.length;
-    } else if (budget > 8) {
-      out.push(w.slice(0, budget).join(' ') + '…');
-      removed += w.length - budget;
-      budget = 0;
-    } else {
-      removed += w.length;
+    removed += w.length;
+  }
+  if (pendingHeading) removed += pendingHeading.split(/\s+/).filter(Boolean).length;
+
+  // A heading whose body was truncated away promises content the section no
+  // longer holds. Pop structural tails until the last kept line is content.
+  while (out.length) {
+    const last = out[out.length - 1].trim();
+    if (!last) { out.pop(); continue; }
+    if (/^#{1,6}\s+\S/.test(last) || /^\*\*[^*]+\*\*:?\s*$/.test(last)) {
+      removed += last.split(/\s+/).filter(Boolean).length;
+      out.pop();
+      continue;
     }
+    break;
   }
   return { lines: out, removed };
 }
@@ -590,6 +643,8 @@ export function postProcessReportMarkdown(
     warnings: [],
     editorialBlocksRemoved: 0,
     editorialWordsRemoved: 0,
+    emptyStatCardsRemoved: 0,
+    duplicateDirectivesRemoved: 0,
   };
 
   const parsed = parseSections(markdown, registry);
@@ -627,9 +682,54 @@ export function postProcessReportMarkdown(
   // Phase 6 — page-pressure trims
   applyPagePressureTrims(preamble, sections, report);
 
-  const finalMarkdown = serializeSections(preamble, sections);
+  // Phase 7 — a labelled block is a promise that a figure follows it.
+  //
+  // Runs LAST, on the assembled document, because a chart repeated across two
+  // sections is only visible once the sections are one string again — and the
+  // word and page counts below must describe what is actually stored.
+  const serialized = serializeSections(preamble, sections);
+  const scrubbed = scrubBlocks(serialized);
+  report.emptyStatCardsRemoved = scrubbed.emptyStatCards;
+  report.duplicateDirectivesRemoved = scrubbed.duplicateDirectives;
+
+  const finalMarkdown = scrubbed.markdown;
   report.finalWordCount = countWords(finalMarkdown);
   report.finalEstimatedPages = estimatePages(finalMarkdown);
 
   return { markdown: finalMarkdown, report };
+}
+
+/**
+ * Label-stripping alone, for documents that are not the Compass: the fork's
+ * FIN/PLDD variants and the condensed Snapshot slice a PARENT whose legacy
+ * generations carry "What This Means" blocks by the dozen, but their own
+ * section lists are not the Compass registry's, so the full post-processor's
+ * word caps and page-pressure trims must not touch them. Every section —
+ * matched or not — is a client's page, which is the same rule the full pass
+ * states above.
+ */
+export function stripEditorialLabelsFromMarkdown(markdown: string): {
+  markdown: string;
+  removedBlocks: number;
+  removedWords: number;
+} {
+  const { preamble, sections } = parseSections(markdown, COMPASS_40_SECTIONS);
+  let removedBlocks = 0;
+  let removedWords = 0;
+
+  const strip = (heading: string, bodyLines: string[]): string[] => {
+    const r = stripEditorialBlocks({ heading, bodyLines });
+    removedBlocks += r.removedBlocks;
+    removedWords += r.removedWords;
+    return r.lines;
+  };
+
+  const strippedPreamble = strip('(preamble)', preamble);
+  for (const s of sections) s.bodyLines = strip(s.heading, s.bodyLines);
+
+  return {
+    markdown: serializeSections(strippedPreamble, sections),
+    removedBlocks,
+    removedWords,
+  };
 }

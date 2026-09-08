@@ -6,6 +6,7 @@ import { Separator } from '@/components/ui/separator';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
+import { FALLBACK_CALENDAR_COLOR } from '@/lib/calendarColors';
 import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { ScrollArea } from '@/components/ui/scroll-area';
@@ -17,6 +18,7 @@ import { getBookingTimezone, AUSTRALIAN_TIMEZONES } from '@/lib/bookingTimezone'
 import { GHLEvent, GHLCalendar, GHLContact } from '@/hooks/useGHLCalendar';
 import { useFinanceContacts, FinanceContact } from '@/hooks/useFinanceContacts';
 import { supabase } from '@/integrations/supabase/client';
+import { invokeSecureFunction } from '@/lib/secureInvoke';
 import { logActivityDirect } from '@/hooks/useActivityLogger';
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, AlertDialogTrigger } from '@/components/ui/alert-dialog';
 import type { BookingRecipient } from './QuickAddAppointmentModal';
@@ -40,6 +42,7 @@ export interface RescheduleData {
   assignedUserId?: string;
   secondaryRecipients?: { financeContactId: string; name: string; email: string }[];
   bookingRecipients?: { name: string; email: string }[];
+  notes?: string;
 }
 
 interface EventDetailsModalProps {
@@ -97,14 +100,66 @@ export function EventDetailsModal({
   const [rescheduleTime, setRescheduleTime] = useState('');
   const [rescheduleDuration, setRescheduleDuration] = useState(30);
   const [rescheduleTimezone, setRescheduleTimezone] = useState<string>(() => getBookingTimezone());
+  // A reschedule usually happens for a reason and the form had nowhere to
+  // record one (audit item 29). Seeded from the booking's existing notes so
+  // rescheduling never silently discards them.
+  const [rescheduleNotes, setRescheduleNotes] = useState('');
   
   // New: Override availability, team member, finance contacts, booking recipients
   const [overrideAvailability, setOverrideAvailability] = useState(false);
   const [selectedTeamMemberId, setSelectedTeamMemberId] = useState<string>('');
   const [selectedFinanceContacts, setSelectedFinanceContacts] = useState<FinanceContact[]>([]);
   const [bookingRecipients, setBookingRecipients] = useState<BookingRecipient[]>([]);
+  /**
+   * Who was invited when this appointment was booked.
+   *
+   * The window showed the client and nobody else, so an operator could not
+   * tell whether the additional contact and the finance partner had been
+   * included — and rescheduling made them add everyone again by hand. The
+   * booking already records this; it was simply never read back.
+   */
+  const [invitedRecipients, setInvitedRecipients] = useState<{ name: string; email: string }[]>([]);
   const [manualRecipientName, setManualRecipientName] = useState('');
   const [manualRecipientEmail, setManualRecipientEmail] = useState('');
+
+  useEffect(() => {
+    if (!open || !event?.id) {
+      setInvitedRecipients([]);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const { data } = await invokeSecureFunction('get-client-data', {
+          listMode: true,
+          listOptions: {
+            table: 'appointment_secondary_recipients',
+            select: 'contact_name, contact_email',
+            filters: { appointment_ghl_id: event.id },
+          },
+        });
+        if (cancelled) return;
+        const seen = new Set<string>();
+        const rows = (data?.records || [])
+          .map((r: { contact_name?: string | null; contact_email?: string | null }) => ({
+            name: (r.contact_name || '').trim(),
+            email: (r.contact_email || '').trim(),
+          }))
+          .filter((r: { email: string }) => {
+            const key = r.email.toLowerCase();
+            if (!key || seen.has(key)) return false;
+            seen.add(key);
+            return true;
+          });
+        setInvitedRecipients(rows);
+      } catch {
+        // A booking whose invitations cannot be read still opens: this is a
+        // record of who was told, not a precondition for viewing the meeting.
+        if (!cancelled) setInvitedRecipients([]);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [open, event?.id]);
 
   useEffect(() => {
     if (open && event?.contactId && fetchContact) {
@@ -182,6 +237,7 @@ export function EventDetailsModal({
       setEditNotes(event.notes || '');
       setEditStatus(event.appointmentStatus || event.status || '');
       
+      setRescheduleNotes(event.notes || '');
       // Initialize reschedule form with current event times in Sydney timezone
       const sydneyStart = getSydneyDateTimeParts(event.startTime);
       setRescheduleDate(sydneyStart.dateStr);
@@ -199,7 +255,7 @@ export function EventDetailsModal({
   const startDate = parseISO(event.startTime);
   const endDate = parseISO(event.endTime);
   const durationMinutes = Math.round((endDate.getTime() - startDate.getTime()) / (1000 * 60));
-  const calendarColor = event.calendarColor || '#3b82f6';
+  const calendarColor = event.calendarColor || FALLBACK_CALENDAR_COLOR;
   const tzAbbr = getSydneyTzAbbr(event.startTime);
   const showLocalTime = isNonSydneyTimezone();
 
@@ -271,6 +327,7 @@ export function EventDetailsModal({
       assignedUserId: (selectedTeamMemberId && selectedTeamMemberId !== 'auto') ? selectedTeamMemberId : undefined,
       secondaryRecipients: secondaryRecipients.length > 0 ? secondaryRecipients : undefined,
       bookingRecipients: bookingRecipientsPayload.length > 0 ? bookingRecipientsPayload : undefined,
+      notes: rescheduleNotes,
     });
     
     setIsSaving(false);
@@ -637,26 +694,18 @@ export function EventDetailsModal({
                 </button>
               </div>
               
-              <div className="flex gap-2 pt-2">
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={handleCancelReschedule}
-                  disabled={isSaving}
-                  className="flex-1"
-                >
-                  <X className="h-3.5 w-3.5 mr-1" />
-                  Cancel
-                </Button>
-                <Button
-                  size="sm"
-                  onClick={handleReschedule}
-                  disabled={isSaving || !rescheduleDate || !rescheduleTime}
-                  className="flex-1"
-                >
-                  <RefreshCw className="h-3.5 w-3.5 mr-1" />
-                  {isSaving ? 'Saving...' : 'Confirm'}
-                </Button>
+              <div className="space-y-2 pt-2">
+                <Label htmlFor="reschedule-notes" className="flex items-center gap-1.5">
+                  <FileText className="h-3.5 w-3.5 text-muted-foreground" />
+                  Notes
+                </Label>
+                <Textarea
+                  id="reschedule-notes"
+                  value={rescheduleNotes}
+                  onChange={(e) => setRescheduleNotes(e.target.value)}
+                  placeholder="Why is this moving? Anything the attendees should know."
+                  rows={3}
+                />
               </div>
             </div>
           ) : (
@@ -751,6 +800,28 @@ export function EventDetailsModal({
             </div>
           )}
 
+          {invitedRecipients.length > 0 && (
+            <div className="space-y-3">
+              <h4 className="font-medium flex items-center gap-2">
+                <Users className="h-4 w-4" />
+                Also invited ({invitedRecipients.length})
+              </h4>
+              <div className="pl-6 space-y-1.5 text-sm">
+                {invitedRecipients.map((r) => (
+                  <div key={r.email} className="flex min-w-0 flex-wrap items-center gap-x-2">
+                    {r.name && <span className="font-medium text-foreground">{r.name}</span>}
+                    <a href={`mailto:${r.email}`} className="min-w-0 truncate text-primary hover:underline">
+                      {r.email}
+                    </a>
+                  </div>
+                ))}
+                <p className="pt-1 text-xs text-muted-foreground">
+                  These people are notified automatically when this appointment is rescheduled or cancelled.
+                </p>
+              </div>
+            </div>
+          )}
+
           {/* Location */}
           {event.address && (
             <div className="flex items-start gap-3">
@@ -794,6 +865,33 @@ export function EventDetailsModal({
         </ScrollArea>
 
         {/* Footer with actions */}
+        {/* The reschedule actions are pinned here rather than living inside the
+            scrolling body. They used to sit below "Notify Finance Contacts",
+            past the fold, and the footer was suppressed while rescheduling — so
+            the primary action of the screen was off-screen with no scrollbar
+            visible to suggest it existed (audit item 29). */}
+        {isRescheduling && (
+          <DialogFooter className="shrink-0 flex-row gap-2 pt-4 sm:justify-between">
+            <Button
+              variant="outline"
+              onClick={handleCancelReschedule}
+              disabled={isSaving}
+              className="flex-1"
+            >
+              <X className="mr-1 h-4 w-4" />
+              Cancel
+            </Button>
+            <Button
+              onClick={handleReschedule}
+              disabled={isSaving || !rescheduleDate || !rescheduleTime}
+              className="flex-1"
+            >
+              <RefreshCw className="mr-1 h-4 w-4" />
+              {isSaving ? 'Saving…' : 'Confirm reschedule'}
+            </Button>
+          </DialogFooter>
+        )}
+
         {(onUpdateEvent || onDeleteEvent) && !isRescheduling && (
           <DialogFooter className="flex-row justify-between sm:justify-between gap-2 pt-4">
             {onDeleteEvent && (

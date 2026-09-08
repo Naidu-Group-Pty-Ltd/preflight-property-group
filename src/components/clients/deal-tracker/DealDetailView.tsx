@@ -1,4 +1,5 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
+import { format } from 'date-fns';
 import { cn } from '@/lib/utils';
 import {
   ArrowLeft,
@@ -15,12 +16,14 @@ import {
   MessageSquareText,
   Sparkles,
   MapPin,
+  Route,
 } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { Checkbox } from '@/components/ui/checkbox';
 import {
   Select,
   SelectContent,
@@ -45,6 +48,8 @@ import {
   CollapsibleTrigger,
 } from '@/components/ui/collapsible';
 import { Deal, RiskStatus, RISK_STATUS_CONFIG, DEAL_TYPE_LABELS } from './types';
+import { deriveDealJourney } from '@/lib/deals/dealJourney.pure';
+import { DealJourneyStrip } from '@/components/deals/journey/DealJourneyStrip';
 import { DealStageTimeline } from './DealStageTimeline';
 import { BuildPaymentTracker } from './BuildPaymentTracker';
 import { DealFinancialControls } from './DealFinancialControls';
@@ -57,6 +62,13 @@ import { LenderSubmissionsPanel } from '@/components/lenders/LenderSubmissionsPa
 import { LenderComparisonSheets } from '@/components/lenders/LenderComparisonSheets';
 import { ComplianceTab } from '@/components/compliance/ComplianceTab';
 import { DocumentsTab } from '@/components/documents/DocumentsTab';
+import {
+  agentFeeEntry,
+  agentFeeReceiptPatch,
+  commissionModelFor,
+  hasTrailAndClawback,
+} from '@/lib/deals/commissionModel.pure';
+import { formatCurrency } from '@/lib/legalMatters';
 
 
 const detailShellClass = cn(
@@ -166,10 +178,18 @@ export function DealDetailView({ deal, clientId, onBack }: DealDetailViewProps) 
 
   const isHnL = deal.deal_type === 'house_and_land';
   const isRefinance = deal.deal_type === 'refinance';
+  // How this deal earns a commission at all — see `commissionModel.pure`.
+  const commissionModel = commissionModelFor(deal.deal_type);
+  // The single agent fee, where there is one. Null on a house-and-land deal,
+  // whose commission is counted per build payment instead.
+  const agentFee = agentFeeEntry(deal);
   const riskConfig = RISK_STATUS_CONFIG[deal.risk_status];
 
-  const completedStages = (deal.stages || []).filter(s => s.status === 'complete').length;
-  const totalStages = (deal.stages || []).length;
+  // One derivation of "where is this deal" — the same rule the pipeline
+  // board and the client portal read, so the three surfaces tell one story.
+  const journey = useMemo(() => deriveDealJourney(deal), [deal]);
+  const completedStages = journey.completedStages;
+  const totalStages = journey.totalStages;
 
   const getDealIcon = () => {
     if (isRefinance) return <RefreshCw className="h-4 w-4 sm:h-5 sm:w-5 text-primary" />;
@@ -209,7 +229,7 @@ export function DealDetailView({ deal, clientId, onBack }: DealDetailViewProps) 
                   </h3>
                   <div className="mt-2 flex flex-wrap items-center gap-2">
                     <Badge variant="outline" className="max-w-full gap-1.5 break-words border-brand-200/25 bg-brand-400/10 text-[10px] text-brand-100 sm:text-xs">
-                      S{deal.current_stage_number}: {deal.current_stage}
+                      {journey.stageNumber ? `S${journey.stageNumber}: ` : ''}{journey.stageLabel}
                     </Badge>
                     <Badge variant="outline" className="max-w-full gap-1.5 break-words text-[10px] sm:text-xs">
                       <MapPin className="h-3 w-3 shrink-0" /> {deal.property_address || 'Address not recorded'}
@@ -266,6 +286,68 @@ export function DealDetailView({ deal, clientId, onBack }: DealDetailViewProps) 
           </div>
         </div>
 
+        <DetailSection
+          title="Where this deal is"
+          description="The journey at a glance — the full stage controls stay below."
+          icon={<Route className="h-4 w-4" />}
+        >
+          <div className="space-y-3">
+            <DealJourneyStrip phases={journey.phases} />
+            {journey.isSettled ? (
+              <p className="rounded-xl border border-success/25 bg-success/10 p-3 text-sm text-success">
+                Settled — every stage of this deal is complete.
+              </p>
+            ) : (
+              <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+                <FieldTile
+                  label="Now"
+                  value={
+                    <span>
+                      {journey.stageLabel}
+                      {journey.stageNumber != null && totalStages > 0 && (
+                        <span className="ml-1.5 text-xs font-normal text-muted-foreground">
+                          S{journey.stageNumber} of {totalStages}
+                        </span>
+                      )}
+                    </span>
+                  }
+                />
+                {journey.currentStage ? (
+                  <>
+                    <FieldTile
+                      label="Our next step"
+                      value={
+                        <span>
+                          {journey.currentStage.internal_action || '—'}
+                          {journey.currentStage.responsible && (
+                            <span className="mt-0.5 block text-xs font-normal text-muted-foreground">
+                              {journey.currentStage.responsible}
+                            </span>
+                          )}
+                        </span>
+                      }
+                    />
+                    <FieldTile label="What the client does" value={journey.currentStage.client_action || '—'} />
+                    <FieldTile
+                      label="Key date"
+                      value={journey.currentStage.key_date ? format(new Date(journey.currentStage.key_date), 'dd MMM yyyy') : '—'}
+                    />
+                  </>
+                ) : (
+                  journey.build && (
+                    <FieldTile label="Build progress" value={`${journey.build.paid}/${journey.build.total} payments made`} />
+                  )
+                )}
+              </div>
+            )}
+            {journey.nextStage && (
+              <p className="text-xs text-muted-foreground">
+                Then: <span className="font-medium text-foreground">{journey.nextStage.stage_name}</span>
+              </p>
+            )}
+          </div>
+        </DetailSection>
+
         <DetailSection title="Deal overview" description="Client/deal identity, address and lifecycle progress." icon={<Building2 className="h-4 w-4" />}>
           <div className="grid gap-3 lg:grid-cols-[1.3fr_0.7fr]">
             <div className="space-y-2">
@@ -295,7 +377,7 @@ export function DealDetailView({ deal, clientId, onBack }: DealDetailViewProps) 
               </div>
               <div className="grid grid-cols-2 gap-2">
                 <FieldTile label="Deal type" value={DEAL_TYPE_LABELS[deal.deal_type]} />
-                <FieldTile label="Current stage" value={`S${deal.current_stage_number}`} />
+                <FieldTile label="Current stage" value={journey.stageNumber != null ? `S${journey.stageNumber}` : journey.phase.label} />
               </div>
             </div>
           </div>
@@ -314,12 +396,19 @@ export function DealDetailView({ deal, clientId, onBack }: DealDetailViewProps) 
                 stages={deal.stages || []}
                 onUpdateStage={(stageId, data) => {
                   updateStage.mutate({ stageId, data });
-                  if (data.status === 'complete' || data.status === 'in_progress') {
-                    const stage = deal.stages?.find(s => s.id === stageId);
-                    if (stage && data.status === 'in_progress') {
+                  // Heal the stored stage after EVERY status change — it used
+                  // to move only when a stage was set in-progress, so a deal
+                  // whose operator only ever ticked "Completed" wore a stale
+                  // badge on every surface that read the stored copy.
+                  if (data.status) {
+                    const nextStages = (deal.stages || []).map(s => (s.id === stageId ? { ...s, ...data } : s));
+                    const healed = deriveDealJourney({ ...deal, stages: nextStages });
+                    const target = healed.currentStage
+                      ?? (healed.stagesComplete ? nextStages.filter(s => s.status === 'complete').sort((a, b) => a.display_order - b.display_order).at(-1) : null);
+                    if (target && (deal.current_stage !== target.stage_name || deal.current_stage_number !== target.stage_number)) {
                       handleDealUpdate({
-                        current_stage: stage.stage_name,
-                        current_stage_number: stage.stage_number,
+                        current_stage: target.stage_name,
+                        current_stage_number: target.stage_number,
                       });
                     }
                   }
@@ -359,7 +448,78 @@ export function DealDetailView({ deal, clientId, onBack }: DealDetailViewProps) 
                 <CollapsibleTrigger asChild><Button variant="ghost" className="h-10 w-full justify-between rounded-xl border border-border dark:border-white/10 bg-background/35 dark:bg-background/35 text-sm font-medium">Generated Documents<ChevronDown className={cn('h-4 w-4 transition-transform', openSections.documents && 'rotate-180')} /></Button></CollapsibleTrigger>
                 <CollapsibleContent className="pt-3"><DocumentsTab clientId={clientId} dealId={deal.id} /></CollapsibleContent>
               </Collapsible>
-              {!isHnL && <p className="rounded-xl border border-border dark:border-white/10 bg-background/35 dark:bg-background/35 p-3 text-xs leading-5 text-muted-foreground">No build progress payment schedule applies to this deal type.</p>}
+              {/* A deal that earns an agent fee shows it HERE, in the section
+                  named for commission. This used to be the sentence "No build
+                  progress payment schedule applies to this deal type" — true,
+                  and a dead end: an existing-property purchase does earn a
+                  fee, and the figure was sitting in a different column under
+                  Financial Controls, which is why the audit reported the
+                  section as having no commission tracking at all. */}
+              {agentFee && (
+                <div className="space-y-2 rounded-xl border border-border bg-background/35 p-3 dark:border-white/10 dark:bg-background/35">
+                  <div className="flex flex-wrap items-baseline justify-between gap-2">
+                    <span className="text-xs font-semibold text-foreground">
+                      {agentFee.label}
+                    </span>
+                    <span className="font-mono text-sm font-semibold text-foreground">
+                      {agentFee.amount !== null
+                        ? formatCurrency(agentFee.amount)
+                        : <span className="font-sans text-xs font-normal text-muted-foreground">Not recorded</span>}
+                    </span>
+                  </div>
+                  {hasTrailAndClawback(deal.deal_type) && (
+                    <dl className="grid grid-cols-2 gap-x-3 gap-y-1 text-[11px] leading-5">
+                      <dt className="text-muted-foreground">Trail (annual)</dt>
+                      <dd className="text-right font-mono text-foreground">
+                        {formatCurrency(deal.trail_commission)}
+                      </dd>
+                      <dt className="text-muted-foreground">Clawback window</dt>
+                      <dd className="text-right font-mono text-foreground">
+                        {typeof deal.clawback_period_months === 'number'
+                          ? `${deal.clawback_period_months} months`
+                          : '—'}
+                      </dd>
+                    </dl>
+                  )}
+                  {/* The receipt. A house-and-land deal marks this per build
+                      payment; this deal type had no payment to hang it off and
+                      so had no way to record the fee arriving at all — which
+                      is the half of "no agent fee tracking" that a display
+                      alone does not answer. */}
+                  <div className="flex flex-wrap items-center gap-2 border-t border-border/60 pt-2 dark:border-white/10">
+                    <Checkbox
+                      id={`agent-fee-received-${deal.id}`}
+                      checked={agentFee.received}
+                      onCheckedChange={(checked) =>
+                        handleDealUpdate(agentFeeReceiptPatch(!!checked, format(new Date(), 'yyyy-MM-dd')))
+                      }
+                    />
+                    <Label
+                      htmlFor={`agent-fee-received-${deal.id}`}
+                      className="cursor-pointer text-[11px] font-medium text-foreground"
+                    >
+                      Commission received
+                    </Label>
+                    {agentFee.received ? (
+                      <Badge variant="outline" className="border-success/30 text-[10px] text-success">
+                        {agentFee.receivedDate
+                          ? `Received ${format(new Date(agentFee.receivedDate), 'd MMM yyyy')}`
+                          : 'Received'}
+                      </Badge>
+                    ) : (
+                      <Badge variant="outline" className="border-brand-500/30 text-[10px] text-brand-600">Due</Badge>
+                    )}
+                  </div>
+                  <p className="text-[11px] leading-5 text-muted-foreground">
+                    {/* Named rather than implied: a reader who wants to change
+                        the figure should not have to hunt for where. */}
+                    The amount is recorded under Financial Controls. This deal type is
+                    paid once rather than stage by stage, so there is no build payment
+                    schedule.
+                  </p>
+                </div>
+              )}
+              {commissionModel === 'none' && <p className="rounded-xl border border-border dark:border-white/10 bg-background/35 dark:bg-background/35 p-3 text-xs leading-5 text-muted-foreground">No build progress payment schedule applies to this deal type.</p>}
             </div>
           </DetailSection>
         </div>

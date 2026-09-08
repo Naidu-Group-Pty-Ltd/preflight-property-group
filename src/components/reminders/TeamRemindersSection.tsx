@@ -1,6 +1,12 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { format, isPast, isToday, formatDistanceToNow } from 'date-fns';
 import { cn } from '@/lib/utils';
+import {
+  REMINDER_TIME_BUCKETS,
+  countByBucket,
+  matchesTimeBucket,
+  type ReminderTimeBucket,
+} from '@/lib/reminders/timeBucket.pure';
 import {
   Bell,
   Plus,
@@ -84,11 +90,23 @@ export function TeamRemindersSection() {
   const [assignedTo, setAssignedTo] = useState<string[]>([]);
   const [clientId, setClientId] = useState<string | null>(null);
 
-  // Edit state
+  // Edit state — full parity with the client reminder editor: title,
+  // priority, assignees, AND the due date/time and notes.
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editTitle, setEditTitle] = useState('');
   const [editPriority, setEditPriority] = useState('medium');
   const [editAssigned, setEditAssigned] = useState<string[]>([]);
+  const [editDueDate, setEditDueDate] = useState('');
+  const [editDescription, setEditDescription] = useState('');
+
+  // Filters — the client tab has a filter bar and this tab had none.
+  const [filterSearch, setFilterSearch] = useState('');
+  const [filterPriority, setFilterPriority] = useState<string>('all');
+  const [filterType, setFilterType] = useState<string>('all');
+  // The chip row the client tab leads with. Its absence is what the audit
+  // reported twice: this tab draws "Overdue" in red on its own rows and had no
+  // way to show only those.
+  const [filterTime, setFilterTime] = useState<ReminderTimeBucket>('all');
 
   // Snooze state
   const [snoozeId, setSnoozeId] = useState<string | null>(null);
@@ -131,18 +149,48 @@ export function TeamRemindersSection() {
     setEditTitle(reminder.title);
     setEditPriority(reminder.priority || 'medium');
     setEditAssigned(reminder.assigned_to || []);
+    setEditDueDate(reminder.due_date ? format(new Date(reminder.due_date), "yyyy-MM-dd'T'HH:mm") : '');
+    setEditDescription(reminder.description || '');
   };
 
   const handleSaveEdit = () => {
     if (!editingId) return;
     updateMutation.mutate(
-      { id: editingId, title: editTitle, priority: editPriority, assigned_to: editAssigned },
+      {
+        id: editingId,
+        title: editTitle,
+        priority: editPriority,
+        assigned_to: editAssigned,
+        ...(editDueDate ? { due_date: new Date(editDueDate).toISOString() } : {}),
+        description: editDescription.trim() || undefined,
+      },
       {
         onSuccess: () => { toast.success('Reminder updated'); setEditingId(null); },
         onError: (err: any) => toast.error(err.message),
       },
     );
   };
+
+  // One clock for the whole render, so a chip's count and the list it filters
+  // to cannot be computed a millisecond either side of midnight.
+  const filterNow = useMemo(() => new Date(), [reminders]);
+  const bucketCounts = useMemo(
+    () => countByBucket(reminders.map((r) => new Date(r.due_date)), filterNow),
+    [reminders, filterNow],
+  );
+
+  const visibleReminders = reminders.filter((r) => {
+    if (!matchesTimeBucket(new Date(r.due_date), filterTime, filterNow)) return false;
+    if (filterPriority !== 'all' && (r.priority || 'medium') !== filterPriority) return false;
+    if (filterType !== 'all' && r.reminder_type !== filterType) return false;
+    if (filterSearch) {
+      const q = filterSearch.toLowerCase();
+      const inTitle = r.title?.toLowerCase().includes(q);
+      const inDescription = r.description?.toLowerCase().includes(q);
+      if (!inTitle && !inDescription) return false;
+    }
+    return true;
+  });
 
   const handleSnooze = (id: string, duration: SnoozeDuration, customDate?: Date) => {
     snoozeMutation.mutate(
@@ -306,6 +354,90 @@ export function TeamRemindersSection() {
 
 
 
+      {/* Filters — mirrors the client tab's bar */}
+      {!isLoading && reminders.length > 0 && (
+        <div className="flex flex-col gap-2.5 rounded-2xl border border-brand-300/15 bg-background/60 p-2.5 dark:bg-black/30">
+          {/* The time buckets, drawn from the same list and judged by the same
+              predicate as the client tab — see `timeBucket.pure`. A count is
+              shown only where there is something to see, so an empty bucket
+              reads as empty rather than as a nought nobody asked for. */}
+          <div
+            role="group"
+            aria-label="Filter team reminders by when they are due"
+            className="flex min-w-0 flex-wrap items-center gap-1.5"
+          >
+            {REMINDER_TIME_BUCKETS.map((bucket) => {
+              const active = filterTime === bucket.value;
+              const count = bucketCounts[bucket.value];
+              return (
+                <Button
+                  key={bucket.value}
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  aria-pressed={active}
+                  onClick={() => setFilterTime(bucket.value)}
+                  className={cn(
+                    'h-9 shrink-0 gap-1.5 rounded-xl border px-3 text-xs font-semibold transition-all',
+                    active
+                      ? 'border-brand-300/45 bg-brand-400/15 text-brand-100'
+                      : 'border-brand-400/15 bg-background/40 text-muted-foreground hover:border-brand-300/30 hover:bg-brand-400/10 hover:text-brand-100 dark:bg-black/30',
+                  )}
+                >
+                  {bucket.label}
+                  {count > 0 && (
+                    <Badge
+                      variant="outline"
+                      className={cn(
+                        'h-4 rounded-full px-1 text-[9px] font-semibold',
+                        bucket.value === 'overdue'
+                          ? 'border-destructive/35 text-destructive'
+                          : 'border-brand-300/30 text-brand-100',
+                      )}
+                    >
+                      {count}
+                    </Badge>
+                  )}
+                </Button>
+              );
+            })}
+          </div>
+
+          <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-center">
+          <Input
+            value={filterSearch}
+            onChange={(e) => setFilterSearch(e.target.value)}
+            placeholder="Search team reminders..."
+            aria-label="Search team reminders"
+            className={cn('h-10 flex-1', premiumTeamInput)}
+          />
+          <Select value={filterPriority} onValueChange={setFilterPriority}>
+            <SelectTrigger aria-label="Filter team reminders by priority" className={cn('h-10 w-full sm:w-[150px]', premiumTeamInput)}>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All priorities</SelectItem>
+              <SelectItem value="low">Low</SelectItem>
+              <SelectItem value="medium">Medium</SelectItem>
+              <SelectItem value="high">High</SelectItem>
+              <SelectItem value="urgent">Urgent</SelectItem>
+            </SelectContent>
+          </Select>
+          <Select value={filterType} onValueChange={setFilterType}>
+            <SelectTrigger aria-label="Filter team reminders by type" className={cn('h-10 w-full sm:w-[150px]', premiumTeamInput)}>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All types</SelectItem>
+              {reminderTypes.map(t => (
+                <SelectItem key={t.value} value={t.value}>{t.label}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          </div>
+        </div>
+      )}
+
       {/* List */}
       {isLoading ? (
         <Card className="relative overflow-hidden rounded-[1.5rem] border border-brand-300/15 bg-[linear-gradient(135deg,rgba(245,158,11,0.08),rgba(2,6,23,0.84)_46%,rgba(0,0,0,0.62))] shadow-[0_22px_70px_rgba(0,0,0,0.30)]">
@@ -337,9 +469,15 @@ export function TeamRemindersSection() {
             </div>
           </CardContent>
         </Card>
+      ) : visibleReminders.length === 0 ? (
+        <Card className="relative overflow-hidden rounded-[1.5rem] border-dashed border-brand-300/25 bg-[linear-gradient(135deg,rgba(245,158,11,0.08),rgba(2,6,23,0.84)_46%,rgba(0,0,0,0.62))] shadow-[0_22px_70px_rgba(0,0,0,0.30)]">
+          <CardContent className="relative px-5 py-10 text-center text-sm text-muted-foreground">
+            No team reminders match the current filters.
+          </CardContent>
+        </Card>
       ) : (
         <div className="min-w-0 space-y-1.5">
-          {reminders.map(reminder => {
+          {visibleReminders.map(reminder => {
             const dueStatus = getDueStatus(reminder.due_date);
             const isOverdue = isPast(new Date(reminder.due_date)) && !isToday(new Date(reminder.due_date));
             const isEditing = editingId === reminder.id;
@@ -453,6 +591,24 @@ export function TeamRemindersSection() {
                         className={cn("h-9 text-sm", premiumTeamInput)}
                         placeholder="Reminder title"
                       />
+                      <Textarea
+                        value={editDescription}
+                        onChange={(e) => setEditDescription(e.target.value)}
+                        rows={2}
+                        className={cn('min-h-[64px] text-sm', premiumTeamInput)}
+                        placeholder="Notes (optional)..."
+                        aria-label="Edit reminder notes"
+                      />
+                      <div className="space-y-1">
+                        <label className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground dark:text-muted-foreground">Due date &amp; time</label>
+                        <Input
+                          type="datetime-local"
+                          value={editDueDate}
+                          onChange={(e) => setEditDueDate(e.target.value)}
+                          className={cn('h-9 text-sm', premiumTeamInput)}
+                          aria-label="Edit reminder due date and time"
+                        />
+                      </div>
                       <div className="grid grid-cols-2 gap-2">
                         <Select value={editPriority} onValueChange={setEditPriority}>
                           <SelectTrigger className={cn("h-9 text-xs", premiumTeamInput)}>
