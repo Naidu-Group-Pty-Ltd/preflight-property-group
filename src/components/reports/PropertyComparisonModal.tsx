@@ -29,7 +29,7 @@ import { logActivityDirect } from '@/hooks/useActivityLogger';
 import { ComparisonPDFGenerator } from './ComparisonPDFGenerator';
 import { ComparisonDownloadButton } from './ComparisonDownloadButton';
 import { ComparisonWeights, DEFAULT_COMPARISON_SETTINGS, DEFAULT_COMPARISON_WEIGHTS, cloneComparisonWeights, comparisonWeightsEqual, parseComparisonTemplateSettings, validateComparisonWeights } from './comparisonConfiguration';
-import { analysisFromComparisonRow, isDisplayableComparisonRow, matchesSelectedReportIds, normaliseComparisonAnalysis } from './comparisonRecovery.pure';
+import { analysisFromComparisonRow, isDisplayableComparisonRow, matchesSelectedReportIds, normaliseComparisonAnalysis, shouldAttemptRecovery } from './comparisonRecovery.pure';
 import { ComparisonResultsPanel } from './ComparisonResultsPanel';
 
 interface PropertyComparisonModalProps {
@@ -97,6 +97,24 @@ interface ComparisonAnalysis {
     }>;
   };
 }
+
+/**
+ * How long the browser waits for a comparison.
+ *
+ * Audit 3 item 13 — "the comparison analysis doesn't work". The client
+ * aborted at 150s while `supabase/config.toml` grants this function 180s, so
+ * an analysis running its PERMITTED budget was reported as a failure at the
+ * 83% mark while it carried on and finished. That is also why the recovery
+ * path below then found nothing: it went looking for a completed row while
+ * the analysis was still running, and honestly reported that it "may still be
+ * finishing in the background".
+ *
+ * The same drift was fixed once already on the CRM conversation sync, and the
+ * lesson taken there applies here: the caller waits as long as the function is
+ * allowed. `propertyComparisonTimeout.spec.ts` reads the declared value out of
+ * `config.toml` and fails if the two separate again.
+ */
+const COMPARISON_TIMEOUT_MS = 180_000;
 
 export function PropertyComparisonModal({
   isOpen,
@@ -278,16 +296,13 @@ export function PropertyComparisonModal({
       requestBody.scoring_weights = cloneComparisonWeights(appliedWeights);
       requestBody.templateId = activeTemplateId;
 
-      let { data, error } = await invokeSecureFunction('compare-investment-reports', requestBody, { timeoutMs: 150000 });
+      let { data, error } = await invokeSecureFunction('compare-investment-reports', requestBody, { timeoutMs: COMPARISON_TIMEOUT_MS });
 
-      // ── The request timed out; the analysis may well have completed ──
-      // Only the transport's own abort counts: `network` is set solely on the
-      // fetch-failed path, so a server-side failure whose message happens to
-      // mention a timeout (a 502 naming a provider timeout) is not mistaken
-      // for a request the server might still be finishing.
-      const timedOut = !!error && error.network === true
-        && (error.code === 'provider_timeout' || /timed out/i.test(error.message || ''));
-      if (timedOut) {
+      // ── No response arrived; the analysis may well have completed ──
+      // The rule lives in the pure module beside the shapes it recovers, and
+      // records why requiring `provider_timeout` here excluded the very case
+      // it most needed to catch.
+      if (shouldAttemptRecovery(error)) {
         setIsRecovering(true);
         try {
           const row = await recoverStoredComparison(attemptStartedIso);
@@ -304,9 +319,15 @@ export function PropertyComparisonModal({
           } else {
             error = {
               ...error!,
-              message: 'The analysis service did not respond in time, and no completed analysis '
-                + 'was found. It may still finish in the background — check History in a minute, '
-                + 'or try again.',
+              // Deliberately says nothing about the cause. The transport's own
+              // message here is "Network/CORS error … check the function
+              // deployment and auth/CORS configuration", which is advice about
+              // the one thing measured to be correct; the real cause has been a
+              // request cut short. The underlying message is still logged for
+              // whoever is reading a console.
+              message: 'The analysis did not return a result, and no completed analysis was '
+                + 'found. It may still be finishing in the background — check History in a '
+                + 'minute, or try again.',
             };
           }
         } finally {

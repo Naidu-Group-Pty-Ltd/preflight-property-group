@@ -30,6 +30,7 @@ import { invokeSecureFunction } from '@/lib/secureInvoke';
 import { useToast } from '@/hooks/use-toast';
 import { format, formatDistanceToNow, subDays } from 'date-fns';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
+import { SearchInput } from '@/components/ui/search-input';
 import { Link } from 'react-router-dom';
 import { useSecureCallLogs } from '@/hooks/useSecureCallLogs';
 import { DashboardThemeFrame } from '@/components/layout/DashboardThemeFrame';
@@ -65,12 +66,12 @@ interface ErrorStats {
 }
 
 const SOURCE_CONFIG: Record<ErrorSource, { label: string; icon: React.ElementType; color: string }> = {
-  investment_report: { label: 'Investment Reports', icon: FileText, color: 'text-info-foreground0' },
-  bulk_generation: { label: 'Bulk Generation', icon: Zap, color: 'text-accent-foreground0' },
-  vapi_call: { label: 'Voice AI (Vapi)', icon: Phone, color: 'text-success-foreground0' },
-  api_service: { label: 'API Services', icon: Bot, color: 'text-warning-foreground0' },
-  email_sync: { label: 'Email Sync', icon: Mail, color: 'text-info-foreground0' },
-  automation: { label: 'Automation', icon: RefreshCw, color: 'text-accent-foreground0' },
+  investment_report: { label: 'Investment Reports', icon: FileText, color: 'text-info' },
+  bulk_generation: { label: 'Bulk Generation', icon: Zap, color: 'text-accent' },
+  vapi_call: { label: 'Voice AI (Vapi)', icon: Phone, color: 'text-success' },
+  api_service: { label: 'API Services', icon: Bot, color: 'text-warning' },
+  email_sync: { label: 'Email Sync', icon: Mail, color: 'text-info' },
+  automation: { label: 'Automation', icon: RefreshCw, color: 'text-accent' },
 };
 
 const SEVERITY_CONFIG: Record<ErrorSeverity, { label: string; variant: 'destructive' | 'default' | 'outline'; icon: React.ElementType }> = {
@@ -296,11 +297,15 @@ export default function ErrorLogs() {
 
   const handleRetryReport = async (reportId: string, address: string) => {
     try {
-      // First, reset the report status to pending
-      await supabase
-        .from('investment_reports')
-        .update({ status: 'pending', error_message: null })
-        .eq('id', reportId);
+      // First, reset the report status to pending — through the broker every
+      // client write uses. A browser UPDATE is author-scoped by RLS, so for a
+      // colleague's report it matched zero rows and reported nothing.
+      const reset = await invokeSecureFunction('manage-investment-reports', {
+        action: 'update',
+        reportId,
+        data: { status: 'pending', error_message: null },
+      });
+      if (reset.error) throw reset.error;
 
       // Call the edge function to regenerate
       const { error } = await invokeSecureFunction('generate-investment-report', {
@@ -443,7 +448,7 @@ export default function ErrorLogs() {
             <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
               <CardTitle className="min-w-0 truncate text-sm font-medium text-muted-foreground">Trend</CardTitle>
               {stats.trend === 'down' ? (
-                <span className="rounded-xl border border-success/25 bg-success/10 p-2 text-success-foreground0">
+                <span className="rounded-xl border border-success/25 bg-success/10 p-2 text-success">
                   <TrendingDown className="h-4 w-4" />
                 </span>
               ) : stats.trend === 'up' ? (
@@ -479,16 +484,14 @@ export default function ErrorLogs() {
         <CardContent className="min-w-0">
           <div className="grid min-w-0 grid-cols-1 gap-3 lg:grid-cols-[minmax(0,1fr)_minmax(10rem,12rem)_minmax(9rem,10rem)_minmax(8.5rem,9rem)] lg:items-center">
             <div className="min-w-0">
-              <div className="relative min-w-0">
-                <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-                <Input
-                  aria-label="Search errors"
-                  placeholder="Search errors..."
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  className="min-w-0 rounded-2xl border-border/70 bg-background/70 pl-9 pr-3 shadow-inner shadow-black/5 transition-all duration-200 placeholder:text-muted-foreground/70 hover:border-primary/30 focus-visible:border-primary/45 focus-visible:ring-2 focus-visible:ring-primary/35 dark:border-white/10 dark:bg-background/55"
-                />
-              </div>
+              <SearchInput
+                value={searchQuery}
+                onValueChange={setSearchQuery}
+                aria-label="Search errors"
+                placeholder="Search errors..."
+                containerClassName="min-w-0"
+                className="min-w-0 rounded-2xl border-border/70 bg-background/70 pr-3 shadow-inner shadow-black/5 transition-all duration-200 placeholder:text-muted-foreground/70 hover:border-primary/30 focus-visible:border-primary/45 focus-visible:ring-2 focus-visible:ring-primary/35 dark:border-white/10 dark:bg-background/55"
+              />
             </div>
 
             <Select value={selectedSource} onValueChange={(v) => setSelectedSource(v as ErrorSource | 'all')}>
@@ -696,7 +699,7 @@ function ErrorList({
     return (
       <Card className={`min-w-0 overflow-hidden rounded-[1.5rem] border ${hasActiveFilters ? 'border-primary/20 bg-[linear-gradient(135deg,hsl(var(--card)/0.98),hsl(var(--primary)/0.06))]' : 'border-success/20 bg-[linear-gradient(135deg,hsl(var(--card)/0.98),hsl(160_84%_39%/0.06))]'} shadow-[0_16px_48px_rgba(15,23,42,0.08)] ring-1 ring-border/40 dark:border-white/10 dark:ring-white/10 dark:shadow-black/25`}>
         <CardContent className="flex min-w-0 flex-col items-center justify-center px-6 py-12 text-center">
-          <span className={`mb-4 flex h-14 w-14 items-center justify-center rounded-2xl border ${hasActiveFilters ? 'border-primary/25 bg-primary/10 text-primary' : 'border-success/25 bg-success/10 text-success-foreground0'} shadow-sm`}>
+          <span className={`mb-4 flex h-14 w-14 items-center justify-center rounded-2xl border ${hasActiveFilters ? 'border-primary/25 bg-primary/10 text-primary' : 'border-success/25 bg-success/10 text-success'} shadow-sm`}>
             {hasActiveFilters ? <Search className="h-7 w-7" /> : <CheckCircle2 className="h-7 w-7" />}
           </span>
           <h3 className="text-lg font-semibold text-foreground">No errors found</h3>

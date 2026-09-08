@@ -5,8 +5,9 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { SearchInput } from '@/components/ui/search-input';
 import {
-  FileText, Search, Loader2, Download,
+  FileText, Loader2, Download,
   BarChart3, PiggyBank, TrendingUp, FileBarChart, Inbox,
   Plus, Send, Clock, CheckCircle2, XCircle, ArrowRight
 } from 'lucide-react';
@@ -17,6 +18,7 @@ import { PortalEmptyState } from '@/components/portal/PortalEmptyState';
 import { PortalPanel, PortalPanelContent } from '@/components/portal/PortalSurface';
 import { getPortalSessionToken } from '@/lib/portalSession';
 import { SUPABASE_URL, SUPABASE_ANON_KEY } from '@/integrations/supabase/env';
+import { PORTFOLIO_REPORT_LABEL } from '@/lib/reports/portfolio/label';
 
 
 function getSessionToken(): string | null {
@@ -27,7 +29,7 @@ function getSessionToken(): string | null {
 
 const reportTypeConfig: Record<string, { label: string; icon: typeof FileText; color: string }> = {
   investment: { label: 'Investment Report', icon: FileBarChart, color: 'border border-primary/20 bg-primary/10 text-primary' },
-  portfolio: { label: 'Portfolio Review', icon: BarChart3, color: 'border border-primary/20 bg-primary/10 text-primary' },
+  portfolio: { label: PORTFOLIO_REPORT_LABEL, icon: BarChart3, color: 'border border-primary/20 bg-primary/10 text-primary' },
   borrowing_capacity: { label: 'Borrowing Capacity', icon: PiggyBank, color: 'border border-primary/20 bg-primary/10 text-primary' },
   cash_flow: { label: 'Cash Flow Analysis', icon: TrendingUp, color: 'border border-primary/20 bg-primary/10 text-primary' },
 };
@@ -52,7 +54,7 @@ const requestStatusConfig: Record<string, { label: string; icon: typeof Clock; c
 };
 
 const requestTypeLabels: Record<string, string> = {
-  portfolio_review: 'Portfolio Performance Review',
+  portfolio_review: PORTFOLIO_REPORT_LABEL,
   borrowing_capacity: 'Borrowing Capacity Snapshot',
   investment_property: 'Investment Property Report',
 };
@@ -178,15 +180,11 @@ export default function PortalReports() {
           {/* Filters */}
           {reports.length > 0 && (
             <div className="space-y-3">
-              <div className="relative">
-                <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-                <Input
-                  placeholder="Search reports..."
-                  value={search}
-                  onChange={(e) => setSearch(e.target.value)}
-                  className="pl-10"
-                />
-              </div>
+              <SearchInput
+                value={search}
+                onValueChange={setSearch}
+                placeholder="Search reports..."
+              />
               <div className="flex flex-wrap gap-2">
                 {filterOptions.map((opt) => (
                   <Button
@@ -292,7 +290,7 @@ export default function PortalReports() {
               className="client-portal-soft-panel"
               icon={<Send className="h-8 w-8" />}
               title="No report requests yet"
-              description="Request a portfolio review, borrowing capacity snapshot, or investment property report when you need a fresh analysis."
+              description={`Request a ${PORTFOLIO_REPORT_LABEL}, borrowing capacity snapshot, or investment property report when you need a fresh analysis.`}
               actionLabel="Make Your First Request"
               onAction={() => setShowRequestForm(true)}
             />

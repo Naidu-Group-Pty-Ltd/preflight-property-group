@@ -10,7 +10,7 @@
  */
 import { render, screen, waitFor, fireEvent, within } from "@testing-library/react";
 import { MemoryRouter, useLocation } from "react-router-dom";
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { afterAll, afterEach, describe, expect, it, vi, beforeEach } from "vitest";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
@@ -66,6 +66,7 @@ vi.mock("@/lib/aml/useAmlV3Flags", () => ({
 import { Toaster, toast } from "sonner";
 
 import AmlAustracReporting from "../AmlAustracReporting";
+import { drainToastTimers } from "../../../test/toastTeardown";
 
 const read = (p: string) => readFileSync(resolve(process.cwd(), p), "utf8");
 
@@ -98,6 +99,16 @@ const REPORT = {
   metadata: { obligation_at: nowIso() },
   created_at: nowIso(), updated_at: nowIso(),
 };
+
+/*
+  This file is the only one in the suite that mounts a `<Toaster />`, which
+  makes it the only one that can end with sonner's uncancellable unmount
+  timer still in flight. When that timer fires after Vitest has disposed this
+  file's jsdom, React reads a `window` that is no longer there and the whole
+  run fails on an unhandled error while every test in it passed. Waiting past
+  the animation window costs 400ms, once. See `src/test/toastTeardown.ts`.
+*/
+afterAll(drainToastTimers);
 
 beforeEach(() => {
   // Call history must not leak between tests: one of these asserts that a
@@ -154,6 +165,84 @@ const selectRow = async (title: string) => {
   fireEvent.click(row);
   return row;
 };
+
+/**
+ * The register on a phone.
+ *
+ * At 390px the table was 775px wide inside a horizontal scroller: Status,
+ * Updated and every action sat off the right-hand edge, the Kind chip was
+ * squeezed to 40px and set `COMPLIANCE_REPORT` one letter per line, and each
+ * row stood 150px tall to hold it. An operator could see that reports
+ * existed and do nothing with them.
+ */
+describe("the register is a list of cards under 768px", () => {
+  /* jsdom's window is 1024px wide and stays however a test leaves it, so the
+     width is put back as well as the mock: `useIsMobile`'s listener reads
+     `innerWidth`, and a test that leaves it at 390 makes every test after it
+     a phone. */
+  afterEach(() => {
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 1024 });
+  });
+
+  const mobile = () => {
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 390 });
+    vi.spyOn(window, "matchMedia").mockImplementation((q: string) => ({
+      matches: /max-width/.test(q), media: q, onchange: null,
+      addListener: () => {}, removeListener: () => {},
+      addEventListener: () => {}, removeEventListener: () => {},
+      dispatchEvent: () => false,
+    }) as unknown as MediaQueryList);
+  };
+
+  it("draws the cards and not the table", async () => {
+    mobile();
+    const { container } = renderPage();
+    await screen.findByRole("button", { name: REPORT.title });
+    expect(container.querySelector("table")).toBeNull();
+  });
+
+  it("draws the table and not the cards on a desktop", async () => {
+    const { container } = renderPage();
+    await screen.findByRole("button", { name: REPORT.title });
+    expect(container.querySelector("table")).not.toBeNull();
+  });
+
+  it("never draws both, so nothing is announced twice", async () => {
+    /* A CSS-hidden copy still carries every accessible name in the
+       document: assistive technology would meet each report's title, its
+       checkbox and each of its actions twice, on whichever layout it is not
+       looking at. `ResponsiveTable` — this repository's own mobile-table
+       pattern — switches on the same hook for the same reason. */
+    mobile();
+    renderPage();
+    expect((await screen.findAllByRole("button", { name: REPORT.title })).length).toBe(1);
+  });
+
+  it("offers the same acts on a card as in a row", async () => {
+    /* One definition of what can be done to a row, rendered in both
+       places. Two copies is how a phone comes to offer an Approve that the
+       desktop has already taken away. */
+    mobile();
+    renderPage();
+    await screen.findByRole("button", { name: REPORT.title });
+    for (const act of ["Edit", "Approve", "Record", "Delete"]) {
+      expect(screen.getByRole("button", { name: new RegExp(`^${act}$`) })).toBeInTheDocument();
+    }
+    const page = read("src/pages/aml/AmlAustracReporting.tsx");
+    expect(page).toContain("rowActions(r, \"end\")");
+    expect(page).toContain("rowActions(r, \"start\")");
+  });
+
+  it("names the kind and the status rather than printing the column", async () => {
+    mobile();
+    renderPage();
+    await screen.findByRole("button", { name: REPORT.title });
+    const page = read("src/pages/aml/AmlAustracReporting.tsx")
+      .replace(/\{\/\*[\s\S]*?\*\/\}/g, "").replace(/\/\*[\s\S]*?\*\//g, "");
+    expect(page).not.toContain("r.kind.toUpperCase()");
+    expect(page).not.toContain("r.status.replace(/_/g");
+  });
+});
 
 describe("drafting is a page, not a dialog", () => {
   /*
@@ -388,10 +477,17 @@ describe("which report am I looking at", () => {
     }
   });
 
-  it("invites a choice when nothing is selected", async () => {
+  it("invites a choice when nothing is selected, without saying where to look", async () => {
+    /* It read "Choose a report on the left". The register IS on the left on
+       a desktop and directly above on a phone, so the sentence was wrong on
+       every small screen — the same rule the AUSTRAC path already holds, that
+       no step may describe its own position. The assertion is the rule
+       rather than the wording. */
     listReports.mockResolvedValue([]);
     renderPage();
-    expect(await screen.findByText(/Choose a report on the left/i)).toBeInTheDocument();
+    const invite = await screen.findByText(/Choose a report/i);
+    expect(invite).toBeInTheDocument();
+    expect(invite.textContent).not.toMatch(/\b(on the left|on the right|above|below)\b/i);
   });
 });
 

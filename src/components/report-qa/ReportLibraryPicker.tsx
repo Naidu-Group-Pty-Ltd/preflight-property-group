@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { Library, Search, Loader2, Check, Filter, Clock, FolderOpen } from 'lucide-react';
+import { Library, Loader2, Check, Filter, Clock, FolderOpen } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import {
   Dialog,
@@ -14,7 +14,8 @@ import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { ClientSearchSelect } from '@/components/ui/ClientSearchSelect';
-import { supabase } from '@/integrations/supabase/client';
+import { SearchInput } from '@/components/ui/search-input';
+import { invokeSecureFunction } from '@/lib/secureInvoke';
 import { useToast } from '@/hooks/use-toast';
 import { format } from 'date-fns';
 import { cn } from '@/lib/utils';
@@ -91,17 +92,25 @@ export function ReportLibraryPicker({ onAdd, existingNames = [], disabled, class
         setClientPropertyIds(null);
         return;
       }
-      const { data, error } = await supabase
-        .from('client_properties')
-        .select('id')
-        .eq('client_id', clientId);
+      // Through the server, not the table: `client_properties` grants SELECT
+      // to `service_role` alone, so this browser read answered `[]` with HTTP
+      // 200 for every user — and the empty list then short-circuits the
+      // library to "no reports" whenever the picker is opened for a client.
+      // The same trap as the report reads below, one table further back.
+      const res = await invokeSecureFunction('get-client-data', {
+        clientId,
+        listMode: true,
+        listOptions: { table: 'client_properties', select: 'id', filters: { client_id: clientId } },
+      });
+      const error = res.error;
+      const data = (res.data?.records ?? null) as Array<{ id: string }> | null;
       if (cancelled) return;
       if (error) {
         console.error('[ReportLibraryPicker] client_properties fetch failed', error);
         setClientPropertyIds([]);
         return;
       }
-      setClientPropertyIds((data ?? []).map((r: any) => r.id));
+      setClientPropertyIds((data ?? []).map((r) => r.id));
     }
     resolve();
     return () => {
@@ -112,25 +121,29 @@ export function ReportLibraryPicker({ onAdd, existingNames = [], disabled, class
   const fetchRows = useCallback(async () => {
     setLoading(true);
     try {
-      let query = supabase
-        .from('investment_reports')
-        .select('id, property_address, report_content, report_tier, report_scope, created_at, is_client_report, client_property_id, status')
-        .eq('is_archived', false)
-        .not('report_content', 'is', null)
-        .order('created_at', { ascending: false })
-        .limit(200);
-
-      if (clientPropertyIds && clientPropertyIds.length > 0) {
-        query = query.in('client_property_id', clientPropertyIds);
-      } else if (clientId && clientPropertyIds && clientPropertyIds.length === 0) {
+      if (clientId && clientPropertyIds && clientPropertyIds.length === 0) {
         setRows([]);
         setLoading(false);
         return;
       }
 
-      const { data, error } = await query;
+      // Through the server, not the table: `investment_reports`' SELECT
+      // policy is `generated_by = auth.uid()`, so a browser read offered a
+      // Q&A user only the reports they had generated themselves and called
+      // that the library. The list carries the headline columns; the body is
+      // fetched per report at pick time, which is also why 200 rows no longer
+      // move 200 documents to draw a list.
+      const { data, error } = await invokeSecureFunction('get-investment-reports', {
+        listMode: true,
+        listOptions: {
+          isArchived: false,
+          status: 'completed',
+          pageSize: 200,
+          ...(clientPropertyIds && clientPropertyIds.length > 0 ? { clientPropertyIds } : {}),
+        },
+      });
       if (error) throw error;
-      setRows((data ?? []) as LibraryRow[]);
+      setRows(((data?.reports ?? []) as LibraryRow[]));
     } catch (e) {
       console.error('[ReportLibraryPicker] fetch failed', e);
       toast({
@@ -176,7 +189,8 @@ export function ReportLibraryPicker({ onAdd, existingNames = [], disabled, class
   const toggle = (id: string) => {
     setSelectedIds((prev) => {
       const next = new Set(prev);
-      next.has(id) ? next.delete(id) : next.add(id);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
       return next;
     });
   };
@@ -199,15 +213,26 @@ export function ReportLibraryPicker({ onAdd, existingNames = [], disabled, class
     setAdding(true);
     try {
       const picks: PickedReport[] = [];
+      const unreadable: string[] = [];
       const existing = new Set(existingNames);
       for (const id of selectedIds) {
         const row = rows.find((r) => r.id === id);
-        if (!row || !row.report_content) continue;
+        if (!row) continue;
         const name = buildName(row);
         if (existing.has(name)) continue;
+        // The body, read for exactly the reports somebody picked.
+        const { data, error } = await invokeSecureFunction('get-investment-reports', { reportId: id });
+        const content: string | null = error ? null : (data?.report?.report_content ?? null);
+        // A report that is complete but carries no body cannot be asked
+        // questions about. Say which one, rather than dropping it silently —
+        // a pick that vanishes with no reason reads as a broken button.
+        if (!content) {
+          unreadable.push(row.property_address ?? 'Untitled report');
+          continue;
+        }
         picks.push({
           name,
-          content: row.report_content,
+          content,
           reportId: row.id,
           propertyAddress: row.property_address ?? 'Unknown',
         });
@@ -215,7 +240,9 @@ export function ReportLibraryPicker({ onAdd, existingNames = [], disabled, class
       if (picks.length === 0) {
         toast({
           title: 'Nothing to add',
-          description: 'Selected reports are already loaded or have no content.',
+          description: unreadable.length
+            ? `No readable content: ${unreadable.join(', ')}.`
+            : 'Selected reports are already loaded or have no content.',
         });
         setAdding(false);
         return;
@@ -230,7 +257,9 @@ export function ReportLibraryPicker({ onAdd, existingNames = [], disabled, class
       setRecentIds(nextRecent);
       toast({
         title: `Added ${picks.length} report${picks.length === 1 ? '' : 's'}`,
-        description: 'Loaded from library as conversation context.',
+        description: unreadable.length
+          ? `Loaded as conversation context. Skipped (no readable content): ${unreadable.join(', ')}.`
+          : 'Loaded from library as conversation context.',
       });
       setSelectedIds(new Set());
       setOpen(false);
@@ -281,15 +310,13 @@ export function ReportLibraryPicker({ onAdd, existingNames = [], disabled, class
 
         <div className="space-y-3 border-b bg-muted/20 px-5 py-4 sm:px-6">
           <div className="flex flex-col sm:flex-row gap-2">
-            <div className="relative flex-1">
-              <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-              <Input
-                value={search}
-                onChange={(e) => setSearch(e.target.value)}
-                placeholder="Search address, tier, scope…"
-                className="h-10 rounded-xl bg-background pl-9 shadow-sm"
-              />
-            </div>
+            <SearchInput
+              value={search}
+              onValueChange={setSearch}
+              placeholder="Search address, tier, scope…"
+              containerClassName="flex-1"
+              className="h-10 rounded-xl bg-background shadow-sm"
+            />
             <div className="w-full sm:w-64">
               <ClientSearchSelect
                 value={clientId ?? null}

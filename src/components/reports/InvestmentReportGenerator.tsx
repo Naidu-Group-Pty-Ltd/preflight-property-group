@@ -16,7 +16,7 @@ import { useNotifications } from '@/contexts/NotificationsContext';
 import { useAuth } from '@/hooks/useAuth';
 import { useActivityLogger } from '@/hooks/useActivityLogger';
 import { addBackgroundJob } from '@/components/BackgroundJobTracker';
-import { Loader2, MapPin, Hash, Globe, TrendingUp, FileText, Link, Upload, X, Image, AlertCircle } from 'lucide-react';
+import { Loader2, MapPin, Hash, Globe, TrendingUp, FileText, Link, Upload, X, Image, AlertCircle, Sparkles } from 'lucide-react';
 import { convertPdfToImages, isPdfFile, isImageFile, imageFileToBase64 } from '@/utils/pdfToImages';
 import { PreGenerationOverrides, PreGenerationData } from './PreGenerationOverrides';
 import { removeCommas } from '@/hooks/useFormattedNumber';
@@ -27,6 +27,8 @@ import { useSearchParams } from 'react-router-dom';
 import { ReportGenerationStatus } from '@/components/billing/ReportGenerationStatus';
 import { TokenCostEstimate } from '@/components/billing/TokenCostEstimate';
 import { estimateTokens } from '@/lib/missionControl';
+import { ENGINE_LABEL } from '@/lib/reports/generationEngine.pure';
+import { cleanListingTitle, composePropertyAddress } from '@/lib/reports/propertyAddress.pure';
 
 
 export function InvestmentReportGenerator() {
@@ -83,8 +85,10 @@ export function InvestmentReportGenerator() {
   // Pre-generation overrides data
   const [preGenData, setPreGenData] = useState<PreGenerationData>({ buildType: 'existing_property' });
 
-  // Generation engine selection (legacy vs compass-40 trimmed)
-  const [generationEngine, setGenerationEngine] = useState<'legacy' | 'compass-40'>('legacy');
+  // The generation engine, fixed rather than chosen — see the Generation Engine
+  // block below. A Compass-tier report always resolves to this engine
+  // server-side, so this is what the row must record.
+  const generationEngine: 'legacy' | 'compass-40' = 'compass-40';
 
   // Whether current query type is property-specific (needs property details, overrides, etc.)
   const isPropertySpecific = queryType === 'address';
@@ -648,17 +652,19 @@ export function InvestmentReportGenerator() {
       const extracted = scrapedResult.extractedDetails || {};
       console.log('Extracted details from scrape:', extracted);
       
-      // Build property address - try multiple sources
-      let propertyAddress = extracted.extractedAddress;
-      if (!propertyAddress && extracted.extractedSuburb && extracted.extractedState) {
-        propertyAddress = `${extracted.extractedSuburb}, ${extracted.extractedState}${extracted.extractedPostcode ? ' ' + extracted.extractedPostcode : ''}`;
-      }
+      // Build the property address from EVERY part the scrape extracted.
+      // This used to be `extracted.extractedAddress` alone, so a listing whose
+      // street line came back on its own ("6 Acer Court") was filed under it
+      // with no suburb — on the report, its title, the activity log and the
+      // notification, not just on the confirmation line below.
+      let propertyAddress = composePropertyAddress({
+        address: extracted.extractedAddress,
+        suburb: extracted.extractedSuburb,
+        state: extracted.extractedState,
+        postcode: extracted.extractedPostcode,
+      });
       if (!propertyAddress) {
-        const title = scrapedResult.metadata?.title || '';
-        const cleanedTitle = title
-          .replace(/\s*[-|]\s*(Domain|realestate\.com\.au|Real Estate|Property|For Sale|Sold).*$/i, '')
-          .replace(/^(Domain|realestate\.com\.au|Real Estate|Property|For Sale)\s*[-|]\s*/i, '')
-          .trim();
+        const cleanedTitle = cleanListingTitle(scrapedResult.metadata?.title || '');
         propertyAddress = cleanedTitle || `Property from ${new URL(propertyUrl).hostname}`;
       }
 
@@ -1073,11 +1079,14 @@ export function InvestmentReportGenerator() {
       console.log('✅ Document parsed successfully:', data);
       const extracted = data.extractedData || {};
       
-      // Build property address
-      let propertyAddress = extracted.extractedAddress;
-      if (!propertyAddress && extracted.extractedSuburb) {
-        propertyAddress = `${extracted.extractedSuburb}${extracted.extractedState ? ', ' + extracted.extractedState : ''}${extracted.extractedPostcode ? ' ' + extracted.extractedPostcode : ''}`;
-      }
+      // The same composition as the URL path — it was the same bug here, and
+      // two copies of "what is this property called" is how they drift.
+      let propertyAddress = composePropertyAddress({
+        address: extracted.extractedAddress,
+        suburb: extracted.extractedSuburb,
+        state: extracted.extractedState,
+        postcode: extracted.extractedPostcode,
+      });
       if (!propertyAddress) {
         propertyAddress = `Property from ${pdfFile.name}`;
       }
@@ -1512,33 +1521,43 @@ export function InvestmentReportGenerator() {
                     </Select>
                   </div>
 
-                  {/* Generation Engine Selection */}
+                  {/*
+                    The engine is STATED, not chosen. This was a two-option
+                    dropdown defaulting to "Legacy Compass — Stable", and that
+                    selection could never take effect: this page sends no
+                    `reportTier`, so the generator defaults the tier to
+                    `compass`, and `isCompassTier` resolves the engine to
+                    Compass every time — deliberately, because the tier is the
+                    data-minimisation boundary and an engine preference must
+                    not be able to pull financial content into a non-financial
+                    report. So every report from this page has always been
+                    generated by this engine, whatever the dropdown said, and
+                    the row then recorded the unused selection as its
+                    `generation_engine` (1,124 rows read "legacy").
+
+                    A dead control is worse than no control — the rule this
+                    repository already applies to the AUSTRAC path card — and
+                    this one was worse than dead: it defaulted to the option
+                    that never ran and called it "battle-tested".
+                  */}
                   <div className="space-y-3">
-                    <Label htmlFor="generationEngine">Generation Engine</Label>
-                    <Select
-                      value={generationEngine}
-                      onValueChange={(value: 'legacy' | 'compass-40') => setGenerationEngine(value)}
-                    >
-                      <SelectTrigger className="reports-select-trigger bg-background">
-                        <SelectValue placeholder="Select engine" />
-                      </SelectTrigger>
-                      <SelectContent className="reports-select-content bg-background z-50">
-                        <SelectItem value="legacy">
-                          <div className="flex flex-col gap-0.5">
-                            <span className="font-medium">Legacy Compass — Stable</span>
-                            <span className="text-xs text-muted-foreground">Full DB template, ~12 chunks, battle-tested</span>
-                          </div>
-                        </SelectItem>
-                        <SelectItem value="compass-40">
-                          <div className="flex flex-col gap-0.5">
-                            <span className="font-medium">Compass-40 — Trimmed</span>
-                            <span className="text-xs text-muted-foreground">~38–42 pages, finance content removed (Financial Analysis Report covers it)</span>
-                          </div>
-                        </SelectItem>
-                      </SelectContent>
-                    </Select>
+                    <Label>Generation Engine</Label>
+                    <div className="rounded-lg border bg-muted/20 p-3">
+                      <div className="flex items-center gap-2">
+                        <Sparkles className="h-4 w-4 text-primary" />
+                        <span className="text-sm font-medium text-foreground">{ENGINE_LABEL['compass-40']}</span>
+                      </div>
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        The engine every Investment Analysis is generated by. ~38–42 pages of
+                        location, demand, risk and recommendation, with the editorial and page
+                        budgets enforced on the finished document. Purchase price, yield, LVR,
+                        loan and ten-year cash flow are deliberately absent — the Financial
+                        Analysis Report covers those.
+                      </p>
+                    </div>
                     <p className="reports-engine-helper text-xs text-muted-foreground">
-                      You can switch engines later via the Regenerate action on each report.
+                      The superseded legacy engine is still reachable on an existing report via
+                      the Regenerate action, for the report types that continue to use it.
                     </p>
                   </div>
 

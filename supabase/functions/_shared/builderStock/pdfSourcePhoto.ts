@@ -37,10 +37,15 @@
 import {
   flattenedPageImageFrom, objectStreamSlices, pageOrderIsAuthoritative,
   parseImagePlacements, parseObjectStream, qualifyingPhotographsFrom, readPdfPage,
-  resolveDrawnForms, resolveDrawnImages, selectPropertyPhotographFrom, IDENTITY,
-  type DrawnImage, type Matrix, type PdfScope,
+  resolveDrawnForms, resolveDrawnImages, selectPropertyPhotographFrom, widgetBaseMatrix,
+  IDENTITY,
+  type DrawnImage, type Matrix, type PdfScope, type PdfWidget,
 } from './pdfPageImages.pure.ts';
-import { assignPdfMediaRoles, type PdfMediaPlacement } from './pdfPrimaryImage.pure.ts';
+import { documentVisualKinds } from './assessSourceImage.ts';
+import { withPdfDecodeSlot } from './pdfDecodeSlot.pure.ts';
+import {
+  assignPdfMediaRoles, coverSearchPages, type PdfMediaPlacement,
+} from './pdfPrimaryImage.pure.ts';
 import { isolatePhotographBand } from './pdfFlattenedPhoto.pure.ts';
 import { cropRows, encodePng, inflate, sha256Hex } from './rasterPng.ts';
 import { validateSourceImageBytes } from './sourceAssets.pure.ts';
@@ -97,6 +102,13 @@ const MAX_FORMS_PER_PAGE = 48;
  *
  * Names stay scoped to the resources that drew them, so `/X0` in one form and
  * `/X0` in another remain two different pictures.
+ *
+ * AND A PAGE SHOWS ITS WIDGETS TOO. A form field's appearance is not named by
+ * the content stream and is not in the page's `/Resources` — it hangs off
+ * `/Annots` — so a brochure filled from a template put its facade render
+ * somewhere no reader here looked. `widgets` carries the visible ones and each
+ * is descended exactly as a drawn form is, under the matrix that maps its
+ * appearance onto the rectangle the page shows it in. See `PdfWidget`.
  */
 async function collectDrawnImages(
   bytes: Uint8Array,
@@ -105,9 +117,25 @@ async function collectDrawnImages(
   base: Matrix,
   depth: number,
   budget = { forms: 0 },
+  widgets: readonly PdfWidget[] = [],
 ): Promise<DrawnImage[]> {
   const placements = parseImagePlacements(content, base);
   const out: DrawnImage[] = resolveDrawnImages(scope, placements);
+
+  for (const widget of widgets) {
+    if (budget.forms >= MAX_FORMS_PER_PAGE) break;
+    budget.forms += 1;
+    const raw = bytes.slice(widget.form.start, widget.form.end);
+    let text: string;
+    try {
+      text = new TextDecoder('latin1').decode(widget.form.flate ? await inflate(raw) : raw);
+    } catch {
+      continue; // an appearance we cannot inflate simply contributes nothing
+    }
+    out.push(...await collectDrawnImages(
+      bytes, widget.form, text, widgetBaseMatrix(widget), depth + 1, budget));
+  }
+
   if (depth >= 4) return out;
 
   for (const { form, base: formBase } of resolveDrawnForms(scope, placements)) {
@@ -154,8 +182,22 @@ export async function recoverCompressedObjects(
     } catch {
       continue;
     }
+    /*
+     * THE LAST GENERATION OF AN OBJECT IS THE LIVE ONE. An incrementally
+     * updated PDF appends each revision after the one it replaces, so when
+     * two object streams both carry object N, the LATER text is what the
+     * document's xref would serve and the earlier is history. This used to
+     * keep the FIRST — measured live, 2 September 2026, on the Watsons Reach
+     * lot 102 brochure (five generations, twenty-one object streams): the
+     * stale generation of the page dictionary mapped its images to the
+     * TEMPLATE's sample artwork — another design's floor plan, labelled
+     * LOT 414 — while the newest generation, never read, mapped the real
+     * 1920x1080 facade render. The raw byte scan already lets the last
+     * occurrence win; the recovered path has to agree, or which generation a
+     * page gets depends on where the writer happened to put it.
+     */
     for (const [number, header] of parseObjectStream(text, slice)) {
-      if (!recovered.has(number)) recovered.set(number, header);
+      recovered.set(number, header);
     }
   }
   return recovered;
@@ -186,7 +228,8 @@ export async function extractPdfPagePhoto(
       /* an unreadable content stream simply contributes nothing */
     }
   }
-  const drawn = await collectDrawnImages(bytes, page, content, IDENTITY, 0);
+  const drawn = await collectDrawnImages(
+    bytes, page, content, IDENTITY, 0, { forms: 0 }, page.widgets);
 
   // (1) The photograph the layout leads with.
   const chosen = selectPropertyPhotographFrom(drawn, page.width, page.height);
@@ -391,7 +434,8 @@ async function discoverCandidates(
         /* an unreadable content stream simply contributes nothing */
       }
     }
-    const drawn = await collectDrawnImages(bytes, page, content, IDENTITY, 0);
+    const drawn = await collectDrawnImages(
+      bytes, page, content, IDENTITY, 0, { forms: 0 }, page.widgets);
 
     for (const candidate of qualifyingPhotographsFrom(drawn, page.width, page.height)) {
       const key = `${candidate.image.objectNumber}:${candidate.image.name}`;
@@ -547,20 +591,130 @@ export async function selectPdfPropertyPrimary(
      * `assignPdfMediaRoles`.
      */
     structuralCoverPage?: number | null;
+    /**
+     * The house design this row states, from the canonical `house_design`
+     * field. Used only where no page named the property itself.
+     */
+    design?: string | null;
+    /**
+     * The row's other identity names — the estate, the project — for the
+     * cover rule's corroboration test alone. See `pageStatesIdentity`.
+     */
+    identityHints?: readonly string[] | null;
   } = {},
 ): Promise<{
   assets: PdfSourceAsset[];
   primary: PdfSourceAsset | null;
   pageOrderAuthoritative: boolean;
 }> {
-  const found = await discoverPdfSourceAssets(bytes, { maxPages: options.maxPages });
+  /*
+   * THE WHOLE ELECTION HOLDS THE DECODE SLOT, discovery and classification
+   * both — see `pdfDecodeSlot.pure.ts` for the five-way 546 this bounds. The
+   * internal discovery call below goes to the unwrapped body, because a slot
+   * taken twice by one caller is a deadlock, not a bound.
+   */
+  return withPdfDecodeSlot(() => selectPdfPropertyPrimaryHoldingSlot(bytes, options));
+}
+
+/**
+ * The election with the slot ALREADY HELD by the caller.
+ *
+ * Exported for `extractFromDocument`, which takes the slot once around the
+ * whole heavy path — the text read as well as the election — so the two
+ * stages of reading one document cannot be interleaved with another
+ * document's. Taking the slot twice in one call stack is a deadlock, not a
+ * bound, which is the entire reason this variant is separate from the
+ * wrapper above.
+ */
+export async function selectPdfPropertyPrimaryHoldingSlot(
+  bytes: Uint8Array,
+  options: {
+    label?: string | null;
+    pageTexts?: string[];
+    maxPages?: number;
+    structuralCoverPage?: number | null;
+    design?: string | null;
+    identityHints?: readonly string[] | null;
+  },
+): Promise<{
+  assets: PdfSourceAsset[];
+  primary: PdfSourceAsset | null;
+  pageOrderAuthoritative: boolean;
+}> {
+  /*
+   * THE EXPENSIVE STEP IS TOLD WHERE TO LOOK.
+   *
+   * Which page can be this property's cover is decidable from the text, which
+   * is already in hand and costs nothing; decoding a page's rasters is what
+   * kills the worker on a heavy brochure. So the pages are chosen first and
+   * only those are materialised. `coverSearchPages` returns a SUPERSET of what
+   * `assignPdfMediaRoles` could choose (see its header), so this cannot remove
+   * a page the decision would have used — and an empty answer means "no
+   * opinion", which leaves the unscoped walk exactly as it was.
+   */
+  const searchPages = coverSearchPages({
+    label: options.label ?? null,
+    pageTexts: options.pageTexts ?? [],
+    design: options.design ?? null,
+    structuralCoverPage: options.structuralCoverPage ?? null,
+    identityHints: options.identityHints ?? [],
+  });
+  /*
+   * NO CANDIDATE PAGE MEANS NO ELECTION, SO NOTHING IS DECODED.
+   *
+   * `coverSearchPages` is a SUPERSET of every page `assignPdfMediaRoles` can
+   * designate — the property covers, the design covers and the structural
+   * page all come from it — so an empty answer here decides the outcome
+   * before a byte of raster is touched: no page can be the cover, no picture
+   * can be primary, and the caller records exactly the refusal it records
+   * today.
+   *
+   * WHAT RUNNING ON ANYWAY COST, MEASURED 6 SEPTEMBER 2026. "EMPTY MEANS
+   * EVERY PAGE" is the right reading for discovery's own callers, but through
+   * THIS path it sent a document nothing could elect into a full-document
+   * walk — materialising rasters, flattening pages, classifying pixels — and
+   * on Lot 709 Verve's 13-page brochure that was ~2.6 s of the ~2.9 s total,
+   * spent producing assets whose only fate was the refusal already decided
+   * above. The worker died inside that waste on every attempt, faster than
+   * any wall-clock deadline could answer for it, and the branch burned its
+   * whole budget without one honest verdict. The same document now refuses
+   * in ~0.3 s.
+   */
+  if (!searchPages.length) {
+    const recovered = await recoverCompressedObjects(bytes);
+    return {
+      assets: [],
+      primary: null,
+      pageOrderAuthoritative: pageOrderIsAuthoritative(bytes, recovered),
+    };
+  }
+  const found = await discoverPdfSourceAssetsHoldingSlot(bytes, {
+    maxPages: options.maxPages,
+    pages: searchPages,
+  });
+
+  /*
+   * WHAT EACH PICTURE IS, before the election — and it has to be read HERE as
+   * well as on the import path.
+   *
+   * "The same decision over the same inputs" is only true if both sides supply
+   * the same inputs. When the visual gate was added it was wired into the
+   * import alone, so a re-derivation re-elected exactly what it had elected
+   * before: lots 109 and 115 Palomino came back out of the v14 reopen still
+   * pointing at `page1:Im3`, the floor plan. This is the path a reopen runs
+   * through, so this is the path that has to look.
+   */
+  const visualKinds = await documentVisualKinds(found.assets);
 
   // The SAME decision an upload and a repair make, over the same inputs.
   const roles = assignPdfMediaRoles({
     label: options.label ?? null,
+    design: options.design ?? null,
+    identityHints: options.identityHints ?? [],
     pageTexts: options.pageTexts ?? [],
     pageOrderAuthoritative: found.pageOrderAuthoritative,
     media: found.assets.map((asset) => asset.placement),
+    visualKinds,
     structuralCoverPage: options.structuralCoverPage ?? null,
   });
 
@@ -585,15 +739,42 @@ export async function selectPdfPropertyPrimary(
  */
 export async function discoverPdfSourceAssets(
   bytes: Uint8Array,
-  options: { maxPages?: number } = {},
+  options: {
+    maxPages?: number;
+    /**
+     * The pages worth DECODING, from `coverSearchPages`.
+     *
+     * Candidate discovery still walks the document — it reads drawing
+     * instructions and is cheap — so `placementsOnPage` is counted over the
+     * whole page exactly as before. What is scoped is `materialise`, which
+     * decodes pixels, and the flattened-page crop, which rasterises one.
+     *
+     * EMPTY OR ABSENT MEANS EVERY PAGE. A caller with no opinion gets the walk
+     * it has always had.
+     */
+    pages?: readonly number[];
+  } = {},
+): Promise<{ assets: PdfSourceAsset[]; pageOrderAuthoritative: boolean }> {
+  // Same bound as the election: one document's buffers at a time per isolate.
+  return withPdfDecodeSlot(() => discoverPdfSourceAssetsHoldingSlot(bytes, options));
+}
+
+async function discoverPdfSourceAssetsHoldingSlot(
+  bytes: Uint8Array,
+  options: {
+    maxPages?: number;
+    pages?: readonly number[];
+  } = {},
 ): Promise<{ assets: PdfSourceAsset[]; pageOrderAuthoritative: boolean }> {
   const recovered = await recoverCompressedObjects(bytes);
   const authoritative = pageOrderIsAuthoritative(bytes, recovered);
   const limit = Math.max(1, Math.min(options.maxPages ?? MAX_PAGES_SEARCHED, MAX_PAGES_SEARCHED));
   const { kept } = await discoverCandidates(bytes, recovered, limit);
+  const only = options.pages?.length ? new Set(options.pages) : null;
 
   const assets: PdfSourceAsset[] = [];
   for (const candidate of kept) {
+    if (only && !only.has(candidate.page)) continue;
     const made = await materialise(bytes, candidate);
     if (!made) continue;
     assets.push({
@@ -605,6 +786,8 @@ export async function discoverPdfSourceAssets(
         name: candidate.resourceName,
         placementsOnPage: candidate.placementsOnPage,
         pagesDrawnOn: 1,
+        // The cover's own statement of emphasis, carried to the role decision.
+        pageAreaShare: candidate.pageAreaShare,
       },
       role: noPrimaryEvidence('the role of this image has not been settled yet'),
     });
@@ -631,6 +814,7 @@ export async function discoverPdfSourceAssets(
   const pagesWithAssets = new Set(assets.map((asset) => asset.page));
   for (let index = 0; index < limit; index++) {
     const page = index + 1;
+    if (only && !only.has(page)) continue;
     if (pagesWithAssets.has(page)) continue;
     const cut = await extractPdfPagePhoto(bytes, index, recovered);
     if (!cut || cut.provenance.method !== 'page_crop') continue;

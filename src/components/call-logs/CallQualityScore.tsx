@@ -165,26 +165,26 @@ export const calculateCallQualityScore = (
 };
 
 const getGradeColor = (grade: string): string => {
-  if (grade.startsWith('A')) return 'border-success/40 bg-success/20 text-success-foreground shadow-success/10';
-  if (grade.startsWith('B')) return 'border-info/40 bg-info/20 text-info-foreground shadow-info/10';
+  if (grade.startsWith('A')) return 'border-success/40 bg-success/20 text-success shadow-success/10';
+  if (grade.startsWith('B')) return 'border-info/40 bg-info/20 text-info shadow-info/10';
   if (grade.startsWith('C')) return 'border-brand-300/40 bg-brand-500/20 text-brand-100 shadow-brand-500/10';
-  if (grade.startsWith('D')) return 'border-warning/40 bg-warning/20 text-warning-foreground shadow-warning/10';
-  return 'border-destructive/40 bg-destructive/20 text-destructive-foreground shadow-destructive/10';
+  if (grade.startsWith('D')) return 'border-warning/40 bg-warning/20 text-warning shadow-warning/10';
+  return 'border-destructive/40 bg-destructive/20 text-destructive shadow-destructive/10';
 };
 
 const getGradeTextColor = (grade: string): string => {
-  if (grade.startsWith('A')) return 'text-success-foreground0';
-  if (grade.startsWith('B')) return 'text-info-foreground0';
+  if (grade.startsWith('A')) return 'text-success';
+  if (grade.startsWith('B')) return 'text-info';
   if (grade.startsWith('C')) return 'text-brand-500';
-  if (grade.startsWith('D')) return 'text-warning-foreground0';
-  return 'text-destructive-foreground0';
+  if (grade.startsWith('D')) return 'text-warning';
+  return 'text-destructive';
 };
 
 const getTrendIcon = (score: number, maxScore: number) => {
   const percentage = (score / maxScore) * 100;
-  if (percentage >= 70) return <TrendingUp className="w-3 h-3 text-success-foreground0" />;
+  if (percentage >= 70) return <TrendingUp className="w-3 h-3 text-success" />;
   if (percentage >= 40) return <Minus className="w-3 h-3 text-brand-500" />;
-  return <TrendingDown className="w-3 h-3 text-destructive-foreground0" />;
+  return <TrendingDown className="w-3 h-3 text-destructive" />;
 };
 
 export const CallQualityScore = ({

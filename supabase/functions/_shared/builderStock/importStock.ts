@@ -19,7 +19,8 @@
  *   to `unknown`.
  */
 import {
-  normaliseStockRow, stockMatchKeys, stockRecordLabel,
+  developmentUnitMatchKey, normaliseStockRow, stockIdentityHints,
+  stockMatchKeys, stockRecordLabel, storedRowDevelopmentUnitKey,
   type NormalisedStockRecord,
 } from './normalise.pure.ts';
 import {
@@ -30,6 +31,7 @@ import {
   lifecycleForMatchedProperty, lifecycleForNewProperty,
 } from './stockLifecycle.pure.ts';
 import { STOCK_IMAGE_BUCKET } from './fileTypes.pure.ts';
+import type { RowLinkDiscovery } from './suppliedEvidence.pure.ts';
 import type { ExtractedMedia } from './extract.ts';
 import {
   attributeDocumentMedia, settleContainerMediaRoles, settleRowAssetRoles,
@@ -37,12 +39,14 @@ import {
 } from './sourceAssets.pure.ts';
 import { roleDetail, roleFromExplicitField } from './sourceImageRole.pure.ts';
 import { chooseAndStorePrimaryImage } from './primaryImage.ts';
+import { readAllRows } from './pagedRead.ts';
 import { assignPdfMediaRolesPerProperty } from './pdfPrimaryImage.pure.ts';
 import {
-  PROVENANCE_VERSION, storeSourceImages, type SourceImageFetcher,
+  carriedSanitizationFor, PROVENANCE_VERSION, storeSourceImages,
+  type SourceImageFetcher,
 } from './sourceImages.ts';
 import { anchorPdfRowsToPages, pdfAnchorPage } from './pdfRowAnchors.pure.ts';
-import { eligibilityDetailFor } from './assessSourceImage.ts';
+import { documentVisualKinds, eligibilityDetailFor } from './assessSourceImage.ts';
 
 /** What `attachDocumentMedia` did with one picture, for a caller that counts. */
 export interface AttachedMedia {
@@ -151,6 +155,13 @@ interface ExistingItem {
   primary_image_id: string | null;
   /** `source_row->>source_anchor`, projected under this alias. */
   source_anchor: string | null;
+  /**
+   * `source_row->>house_design`, projected the same way and for the same
+   * reason: it is part of both the match key and the identity, and it is not
+   * a column of its own. A scalar out of the JSON costs what the anchor
+   * costs, which is why the blob itself still stays unread.
+   */
+  house_design: string | null;
 }
 
 /**
@@ -179,7 +190,8 @@ interface AnchoredProperty {
 const EXISTING_ITEM_SELECT = 'id, external_reference, development_name, project_name, '
   + 'unit_number, lot_number, address_line, suburb, building_size_sqm, '
   + 'lifecycle_status, upload_id, primary_image_id, '
-  + 'source_anchor:source_row->>source_anchor';
+  + 'source_anchor:source_row->>source_anchor, '
+  + 'house_design:source_row->>house_design';
 
 /**
  * Lend a property's settled imagery to the row a re-import just created.
@@ -247,11 +259,7 @@ function referenceKey(item: ExistingItem): string | null {
   return value || null;
 }
 
-function developmentUnitKey(item: ExistingItem): string | null {
-  const development = (item.development_name ?? item.project_name ?? '').trim().toLowerCase();
-  const unit = (item.unit_number ?? item.lot_number ?? '').trim().toLowerCase();
-  return development && unit ? `${development}|${unit}` : null;
-}
+const developmentUnitKey = storedRowDevelopmentUnitKey;
 
 /** Only the fields the record actually carries. Null means "the file was silent". */
 function writablePatch(record: NormalisedStockRecord): Record<string, unknown> {
@@ -316,12 +324,15 @@ async function buildInventoryIndex(db: any, organisationId: string): Promise<{
 
   const projectIds = Array.from(new Set(Array.from(projectByName.values())));
   if (projectIds.length) {
-    const { data: units } = await db
-      .from('builder_units')
-      .select('id, project_id, unit_number')
-      .in('project_id', projectIds)
-      .limit(5000);
-    for (const unit of units ?? []) {
+    // Paged: `.limit(5000)` is capped at 1,000 by the API, and a unit missing
+    // from this map is a unit the import cannot link. See `pagedRead.ts`.
+    const unitPage = await readAllRows<{ id: string; project_id: string; unit_number: unknown }>(
+      () => db
+        .from('builder_units')
+        .select('id, project_id, unit_number')
+        .in('project_id', projectIds)
+        .order('id', { ascending: true }));
+    for (const unit of unitPage.rows) {
       const number = String(unit.unit_number ?? '').trim().toLowerCase();
       if (number) unitByProjectAndNumber.set(`${unit.project_id}|${number}`, unit.id);
     }
@@ -366,6 +377,23 @@ const IMAGE_BUDGET_MS = 8_000;
  */
 const MAX_IMAGES_PER_IMPORT = 20;
 
+/**
+ * One record as `source_row` stores it, carrying the link-discovery stamp.
+ *
+ * The stamp rides INSIDE the row rather than on the item or the upload
+ * because the row is the one thing every later reading holds: the settler
+ * reads `source_row` to find a property's branches, and the fallback gate
+ * reads the same column to decide whether those branches are the whole story.
+ * A stamp kept anywhere else is a stamp a reader can fail to join.
+ */
+function stampedRow(
+  record: unknown,
+  discovery?: RowLinkDiscovery | null,
+): Record<string, unknown> {
+  const row = record as Record<string, unknown>;
+  return discovery ? { ...row, link_discovery: discovery } : { ...row };
+}
+
 export async function importStockRecords(
   db: any,
   input: {
@@ -398,6 +426,13 @@ export async function importStockRecords(
     pageOrderAuthoritative?: boolean;
     /** The uploaded document's own name, recorded on every image it yielded. */
     filename?: string | null;
+    /**
+     * What the import managed to see of each row's link layer — stamped onto
+     * every `source_row` it writes, because the reading has to survive on the
+     * ROW: the gate that decides whether the online fallback may run reads
+     * stored rows, long after this run and its upload metadata are gone.
+     */
+    linkDiscovery?: RowLinkDiscovery | null;
   },
   /**
    * Injected for the same reason the repair injects it: the production fetcher
@@ -444,6 +479,7 @@ export async function importStockRecords(
    */
   const itemIdByAnchor = new Map<string, string | null>();
   const labelByItemId = new Map<string, string>();
+  const identityHintsByItemId = new Map<string, readonly string[]>();
   const claimAnchor = (anchor: string | null, itemId: string) => {
     if (!anchor) return;
     if (!itemIdByAnchor.has(anchor)) { itemIdByAnchor.set(anchor, itemId); return; }
@@ -480,12 +516,23 @@ export async function importStockRecords(
     });
   }
 
-  const { data: existingRows, error: existingError } = await db
-    .from('builder_stock_items')
-    .select(EXISTING_ITEM_SELECT)
-    .eq('organisation_id', input.organisationId)
-    .order('created_at', { ascending: true })
-    .limit(20000);
+  /*
+   * PAGED. `.limit(20000)` was never honoured — the API caps a response at
+   * 1,000 rows — so past a thousand properties this index silently held only
+   * the oldest thousand, and the note below applied to every property after
+   * them. `id` joins the ordering because `created_at` is not unique and
+   * offset paging needs a total order. See `pagedRead.ts`.
+   */
+  const existingPage = await readAllRows<ExistingItem>(
+    () => db
+      .from('builder_stock_items')
+      .select(EXISTING_ITEM_SELECT)
+      .eq('organisation_id', input.organisationId)
+      .order('created_at', { ascending: true })
+      .order('id', { ascending: true }));
+  const existingRows = existingPage.rows;
+  const existingError = existingPage.failed
+    ? (existingPage.error as { message?: string } | null) : null;
 
   /*
    * A FAILED READ IS NOT AN EMPTY ORGANISATION.
@@ -635,7 +682,7 @@ export async function importStockRecords(
       const existingId = (anchored && !anchorDifferences.length ? anchored.id : undefined)
         ?? (keys.reference ? byReference.get(keys.reference) : undefined)
         ?? (keys.developmentUnit
-          ? byDevelopmentUnit.get(`${keys.developmentUnit.development}|${keys.developmentUnit.unit}`)
+          ? byDevelopmentUnit.get(developmentUnitMatchKey(keys.developmentUnit))
           : undefined);
 
       const patch = writablePatch(record);
@@ -715,11 +762,11 @@ export async function importStockRecords(
              */
             pending_upload_id: input.uploadId,
             pending_patch: patch,
-            source_row: record as unknown as Record<string, unknown>,
+            source_row: stampedRow(record, input.linkDiscovery),
           } : {
             ...patch,
             upload_id: input.uploadId,
-            source_row: record as unknown as Record<string, unknown>,
+            source_row: stampedRow(record, input.linkDiscovery),
             /*
              * REVIVES AN ARCHIVED ROW; NEVER PUBLISHES A STAGED ONE. This used
              * to be a flat `'active'`, which was right when there were two
@@ -747,7 +794,7 @@ export async function importStockRecords(
             upload_id: input.uploadId,
             first_upload_id: input.uploadId,
             created_by_builder_user_id: input.builderUserId,
-            source_row: record as unknown as Record<string, unknown>,
+            source_row: stampedRow(record, input.linkDiscovery),
             availability_status: patch.availability_status ?? 'unknown',
             lifecycle_status: newPropertyLifecycle,
             last_seen_at: now,
@@ -802,8 +849,7 @@ export async function importStockRecords(
         const reference = keys.reference;
         if (reference) byReference.set(reference, itemId);
         if (keys.developmentUnit) {
-          byDevelopmentUnit.set(
-            `${keys.developmentUnit.development}|${keys.developmentUnit.unit}`, itemId);
+          byDevelopmentUnit.set(developmentUnitMatchKey(keys.developmentUnit), itemId);
         }
       }
 
@@ -821,8 +867,10 @@ export async function importStockRecords(
 
       outcome.itemIds.push(itemId);
       // The label the property was matched on, kept so a paginated source can
-      // ask which page states THIS property's identity.
+      // ask which page states THIS property's identity — and the identity
+      // names the label leaves out, for the corroboration test alone.
       labelByItemId.set(itemId, label);
+      identityHintsByItemId.set(itemId, stockIdentityHints(record));
       claimAnchor(record.source_anchor, itemId);
 
       /**
@@ -897,6 +945,7 @@ export async function importStockRecords(
     input.pageTexts?.length
       ? {
         labelByItemId,
+        identityHintsByItemId,
         pageTexts: input.pageTexts,
         pageOrderAuthoritative: input.pageOrderAuthoritative !== false,
       }
@@ -952,12 +1001,43 @@ export async function importStockRecords(
    * price, availability, configuration, selection or linkage is written here.
    */
   if (outcome.itemIds.length) {
+    const touched = [...new Set(outcome.itemIds)];
     await db.from('builder_stock_items')
       .update({ enrichment_status: 'pending' })
       // Scoped like every other write in this module: an id in a list is a
       // lookup key, never authority.
       .eq('organisation_id', input.organisationId)
-      .in('id', [...new Set(outcome.itemIds)]);
+      .in('id', touched);
+
+    /*
+     * AND `enrichment_status` IS NOT THE ONLY LATCH. `image_work_stage` is,
+     * and a property that has been through the ladder once is left `settled`
+     * — which `settleItemImages` reads as "there is nothing further to try".
+     * So a re-import that gave a property a document it did not have before
+     * updated its price and its sizes, marked it pending, and never looked at
+     * the document: exactly the shape of the defect that left twenty-six live
+     * properties with a brochure the reader had only just learned to see.
+     *
+     * REOPENED ONLY WHERE THERE IS SOMETHING TO GAIN, in the link recovery's
+     * own words and by its own rule — a property already holding an image has
+     * its builder's picture, and re-running the source stage for it would
+     * spend a claim to reach the same answer. The ladder's own attempt counts
+     * and its banked negatives still decide what is actually re-asked; this
+     * only makes the property visible to them again.
+     *
+     * Pipeline state, never property data: no price, availability,
+     * configuration, selection or linkage is written here.
+     */
+    await db.from('builder_stock_items')
+      .update({
+        image_work_stage: 'source',
+        image_work_claim_until: null,
+        image_work_next_attempt_at: new Date().toISOString(),
+        image_work_updated_at: new Date().toISOString(),
+      })
+      .eq('organisation_id', input.organisationId)
+      .in('id', touched)
+      .is('primary_image_id', null);
   }
 
   outcome.replacesUploadIds = [...supersededUploads];
@@ -1031,6 +1111,8 @@ export async function attachDocumentMedia(
    */
   paginated?: {
     labelByItemId: Map<string, string>;
+    /** Each property's other identity names. See `pageStatesIdentity`. */
+    identityHintsByItemId?: Map<string, readonly string[]>;
     pageTexts: string[];
     pageOrderAuthoritative: boolean;
   } | null,
@@ -1065,10 +1147,24 @@ export async function attachDocumentMedia(
    * image as THIS property's listing image? Without it, "source_supplied" was
    * read as "safe to show", and a bedroom render reached a client's card.
    */
+  /*
+   * WHAT EACH PICTURE IS, before anything decides which one leads a card.
+   *
+   * Only the PDF path asks: it is the one that elects a hero from several
+   * pictures on a page using the document's own emphasis, and a brochure that
+   * leads with its floor plan states the plan exactly as emphatically as one
+   * that leads with the house. Two live Palomino cards drew a green line
+   * drawing badged "Builder supplied" for that reason.
+   */
+  const visualKinds = paginated
+    ? await documentVisualKinds(input.media)
+    : [];
+
   const roles = paginated
     ? assignPdfMediaRolesPerProperty({
       media: input.media,
       stockItemIds: attributions.map((attribution) => attribution.stockItemId),
+      visualKinds,
       ...paginated,
     })
     : settleContainerMediaRoles({
@@ -1088,6 +1184,24 @@ export async function attachDocumentMedia(
 
       const attribution = attributions[index];
       const stockItemId = attribution.stockItemId;
+
+      /*
+       * WHAT A RE-IMPORT MUST NOT TAKE WITH IT.
+       *
+       * This is the path a builder's second upload of the same stock list runs
+       * through, and the upsert below replaces `source_detail` wholesale — so
+       * without this it destroys the sanitization record for bytes that have
+       * not changed. See `sanitizationCarryForward`. A row with no owning
+       * property has no per-property record to carry, so it is not asked.
+       */
+      const carried = stockItemId
+        ? await carriedSanitizationFor(db, {
+          stockItemId,
+          sourceStage: 'uploaded_document',
+          reference: media.name.slice(0, 400),
+          storedSha256: media.provenance?.storedSha256 ?? null,
+        })
+        : {};
 
       await db.from('builder_stock_item_images').upsert({
         stock_item_id: stockItemId,
@@ -1147,6 +1261,9 @@ export async function attachDocumentMedia(
               provenance_version: PROVENANCE_VERSION,
             }
             : {}),
+          // Last, so a re-import cannot lose what another stage established
+          // about these exact bytes — and only ever the keys that stage owns.
+          ...carried,
         },
       }, { onConflict: 'stock_item_id,source_stage,source_reference' });
       attached.push({

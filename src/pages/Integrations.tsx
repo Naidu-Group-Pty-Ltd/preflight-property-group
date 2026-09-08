@@ -52,6 +52,7 @@ import {
   ShoppingCart,
 } from 'lucide-react';
 import { Alert, AlertDescription } from '@/components/ui/alert';
+import { SearchInput } from '@/components/ui/search-input';
 import { PlannedIntegrations } from '@/components/integrations/PlannedIntegrations';
 import { BrandMark } from '@/components/integrations/BrandMark';
 import { getBrandProfile } from '@/lib/integrations/brandProfiles';
@@ -359,7 +360,7 @@ export default function Integrations() {
     if (status === 'configured') {
       return {
         className: 'border-success/20 bg-success/10 text-success dark:text-success',
-        iconClassName: 'text-success-foreground0 dark:text-success',
+        iconClassName: 'text-success dark:text-success',
         label: 'Required credentials saved',
         detail: `${configuredRequiredFields.length}/${requiredFields.length} required fields configured`,
       };
@@ -388,14 +389,14 @@ export default function Integrations() {
     switch (status) {
       case 'configured':
         return (
-          <Badge variant="outline" className={`${baseBadgeClass} border-success/30 bg-success/10 text-success-foreground0 dark:text-success`}>
+          <Badge variant="outline" className={`${baseBadgeClass} border-success/30 bg-success/10 text-success dark:text-success`}>
             <CheckCircle2 className="h-3 w-3 shrink-0" />
             <span className="truncate">Configured</span>
           </Badge>
         );
       case 'connected':
         return (
-          <Badge variant="outline" className={`${baseBadgeClass} border-success/30 bg-success/10 text-success-foreground0 dark:text-success`}>
+          <Badge variant="outline" className={`${baseBadgeClass} border-success/30 bg-success/10 text-success dark:text-success`}>
             <CheckCircle2 className="h-3 w-3 shrink-0" />
             <span className="truncate">Connected</span>
           </Badge>
@@ -502,7 +503,7 @@ export default function Integrations() {
         <TooltipProvider>
           <Tooltip>
             <TooltipTrigger asChild>
-              <Badge variant="outline" className="max-w-full gap-1 rounded-full border border-success/30 bg-success/10 px-2.5 py-1 text-[11px] font-semibold leading-none text-success-foreground0 shadow-sm dark:text-success">
+              <Badge variant="outline" className="max-w-full gap-1 rounded-full border border-success/30 bg-success/10 px-2.5 py-1 text-[11px] font-semibold leading-none text-success shadow-sm dark:text-success">
                 <Cloud className="h-3 w-3 shrink-0" />
                 <span className="truncate">Supabase</span>
               </Badge>
@@ -829,17 +830,14 @@ export default function Integrations() {
               </TabsList>
             </div>
 
-            <div className="relative min-w-0 lg:w-80">
-              <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
-              <Input
-                type="search"
-                value={search}
-                onChange={(e) => setSearch(e.target.value)}
-                placeholder="Search integrations, services or keys…"
-                aria-label="Search integrations"
-                className="min-h-11 rounded-2xl border-border/70 bg-card/80 pl-9 pr-3 shadow-inner transition-all placeholder:text-muted-foreground/70 focus-visible:border-primary/60 focus-visible:ring-2 focus-visible:ring-primary/35"
-              />
-            </div>
+            <SearchInput
+              value={search}
+              onValueChange={setSearch}
+              placeholder="Search integrations, services or keys…"
+              aria-label="Search integrations"
+              containerClassName="min-w-0 lg:w-80"
+              className="min-h-11 rounded-2xl border-border/70 bg-card/80 pr-3 shadow-inner transition-all placeholder:text-muted-foreground/70 focus-visible:border-primary/60 focus-visible:ring-2 focus-visible:ring-primary/35"
+            />
           </div>
 
           {statusTab !== 'planned' && (

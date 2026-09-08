@@ -12,6 +12,9 @@ import { useToast } from '@/hooks/use-toast';
 import { useNotifications } from '@/contexts/NotificationsContext';
 import { useAuth } from '@/hooks/useAuth';
 import jsPDF from 'jspdf';
+import { deliverInvestmentPdf, produceInvestmentDocument } from '@/lib/reports/investment/deliverInvestmentPdf';
+import { ReportTemplateSelector } from '@/components/reports/ReportTemplateSelector';
+import { INVESTMENT_REPORT_FORMAT } from '@/lib/reportTemplate/reportFormats';
 import { ReportGenerationStatus } from '@/components/billing/ReportGenerationStatus';
 import { TokenCostEstimate } from '@/components/billing/TokenCostEstimate';
 import { estimateTokens } from '@/lib/missionControl';
@@ -33,6 +36,7 @@ export function InvestmentReportModal({
   const [reportContent, setReportContent] = useState<string>('');
   const [sourcesContent, setSourcesContent] = useState<string>('');
   const [reportId, setReportId] = useState<string>('');
+  const [isDownloading, setIsDownloading] = useState(false);
   const [isCopied, setIsCopied] = useState(false);
   const [hasStartedGeneration, setHasStartedGeneration] = useState(false);
   const [enhancedData, setEnhancedData] = useState<any>(null);
@@ -290,13 +294,36 @@ export function InvestmentReportModal({
 
   const pdfFilename = `investment-report-${propertyAddress.replace(/[^a-zA-Z0-9]/g, '-')}.pdf`;
 
-  const downloadPDF = () => {
+  /**
+   * A saved report downloads through the unified delivery — the same
+   * template-first road as the report page, with the legacy server route
+   * behind it. The raw-text jsPDF dump this modal used to draw survives only
+   * for the one state with no saved row to deliver, because a text dump of
+   * the markdown is then the only artifact that exists.
+   */
+  const downloadPDF = async () => {
+    if (isDownloading) return;
+    if (reportId) {
+      setIsDownloading(true);
+      try {
+        await deliverInvestmentPdf(reportId);
+      } catch (error) {
+        toast({
+          title: "Download Failed",
+          description: error instanceof Error ? error.message : "The report PDF could not be produced.",
+          variant: "destructive",
+        });
+      } finally {
+        setIsDownloading(false);
+      }
+      return;
+    }
     try {
       const pdf = buildPdfDoc();
       pdf.save(pdfFilename);
       toast({
         title: "PDF Downloaded",
-        description: "Investment report downloaded successfully.",
+        description: "Unsaved report exported as plain text PDF.",
       });
     } catch (error) {
       toast({
@@ -550,12 +577,17 @@ export function InvestmentReportModal({
                     variant="outline"
                     size="sm"
                     onClick={downloadPDF}
+                    disabled={isDownloading}
                   >
-                    <Download className="h-4 w-4 mr-2" />
-                    Download PDF
+                    {isDownloading
+                      ? <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                      : <Download className="h-4 w-4 mr-2" />}
+                    {isDownloading ? 'Preparing…' : 'Download PDF'}
                   </Button>
                   <FlattenPdfIconButton
-                    getPdfBlob={async () => buildPdfDoc().output('blob')}
+                    getPdfBlob={async () => reportId
+                      ? (await produceInvestmentDocument(reportId)).blob
+                      : buildPdfDoc().output('blob')}
                     filename={pdfFilename}
                   />
                   {reportId && (
@@ -578,6 +610,18 @@ export function InvestmentReportModal({
                 </Button>
               </div>
 
+              {reportId ? (
+                <div className="mb-4">
+                  {/* Which template a saved report comes out in — the unified
+                      delivery below resolves it, and this modal offered no way
+                      to see or change it. Unsaved reports export as the plain
+                      text dump and take no template. */}
+                  <ReportTemplateSelector
+                    reportType={INVESTMENT_REPORT_FORMAT.reportType}
+                    formatLabel={INVESTMENT_REPORT_FORMAT.label}
+                  />
+                </div>
+              ) : null}
               <ScrollArea className="flex-1 border rounded-lg p-6">
                 <div className="prose prose-sm max-w-none dark:prose-invert">
                   <ReactMarkdown 

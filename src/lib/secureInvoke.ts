@@ -166,7 +166,7 @@ export function isAuthFailureResponse(status: number, message?: string | null): 
 
 export interface InvokeResult<T = any> {
   data: T | null;
-  error: { message: string; status?: number; functionName?: string; network?: boolean; code?:string; stage?:string; correlationId?:string; retryable?:boolean } | null;
+  error: { message: string; /** The server's `details` — the cause behind a generic message. */ details?: string; status?: number; functionName?: string; network?: boolean; code?:string; stage?:string; correlationId?:string; retryable?:boolean } | null;
 }
 
 function getStoredToken(key: string): string | null {
@@ -271,6 +271,48 @@ export async function resolveAuthBearer(
 /**
  * Invoke an edge function with HttpOnly cookie support
  */
+const RENDER_ROUTE_RE = /^render-([a-z-]+)-pdf$/;
+const RENDER_ROUTE_FORMAT: Record<string, string> = {
+  'borrowing-capacity': 'borrowing_capacity',
+  'cash-flow': 'cashflow',
+  'cash-flow-comparison': 'cash_flow_comparison',
+  'client-details': 'client_details',
+  'commercial-capacity': 'commercial_capacity',
+  'market-intelligence': 'market_intelligence',
+  'portfolio-review': 'portfolio',
+  'property-comparison': 'comparison',
+  'report-qa': 'qa',
+  'investment-report': 'investment',
+};
+
+function maybeLogRenderCoverage(functionName: string, body: Record<string, any> | undefined, data: unknown): void {
+  try {
+    let engine: 'template' | 'design_composer' | 'legacy_server' | null = null;
+    let format = '';
+    if (functionName === 'render-template-pdf') {
+      engine = 'template';
+      format = String(body?.reportType ?? body?.format ?? '');
+    } else {
+      const m = RENDER_ROUTE_RE.exec(functionName);
+      if (!m || !(m[1] in RENDER_ROUTE_FORMAT)) return;
+      format = RENDER_ROUTE_FORMAT[m[1]];
+      engine = functionName === 'render-investment-report-pdf' ? 'legacy_server' : 'design_composer';
+    }
+    // A route that answered but reported failure is not a produced document.
+    if (data && typeof data === 'object' && (data as any).success === false) return;
+    const reportId = [body?.reportId, body?.assessmentId, body?.comparisonId, body?.conversationId, body?.clientId]
+      .find((v) => typeof v === 'string' && v);
+    void import('@/lib/reports/renderEvent').then(({ logReportRenderEvent }) => {
+      logReportRenderEvent({
+        format: format || 'unknown',
+        engine: engine!,
+        source: 'engine_auto',
+        reportId: (reportId as string | undefined) ?? null,
+      });
+    }).catch(() => {});
+  } catch { /* coverage must never affect the call it observed */ }
+}
+
 export async function invokeSecureFunction<T = any>(
   functionName: string,
   body?: Record<string, any>,
@@ -450,9 +492,24 @@ export async function invokeSecureFunction<T = any>(
         ? data.error.message
         : data?.error || data?.message || `HTTP ${response.status}`;
 
+      // ── Carry the server's `details` onto the error ──
+      // Several functions answer a failure with a generic sentence in `error`
+      // and the actual cause in `details` — `manage-client-data` returns
+      // `{ error: 'Failed to update record', details: <the database message> }`.
+      // Nothing here read `details`, so every caller that reports
+      // `error.message` showed six words that name no cause and cannot be
+      // acted on. That is how "Failed to update: Failed to update record"
+      // came to be all anybody could see when marking a commission received.
+      //
+      // It is carried rather than concatenated, so a caller decides whether an
+      // operator sees it; but it is no longer thrown away before they can.
+      const errorDetails = typeof data?.details === 'string' && data.details.trim()
+        ? data.details.trim()
+        : undefined;
+
       return { 
         data: data as T, 
-        error: { message: String(errorMessage), status: response.status, functionName, code:data?.error?.code ?? data?.code, stage:data?.stage, correlationId:responseCorrelationId, retryable:data?.retryable }
+        error: { message: String(errorMessage), details: errorDetails, status: response.status, functionName, code:data?.error?.code ?? data?.code, stage:data?.stage, correlationId:responseCorrelationId, retryable:data?.retryable }
       };
     }
     
@@ -475,6 +532,15 @@ export async function invokeSecureFunction<T = any>(
         });
       }
     }
+
+    // ── Render-coverage telemetry (fire-and-forget) ──────────────────────
+    // Every server render route answered here successfully is one produced
+    // document, and docs/reports/COVERAGE.md exists because most pathways
+    // recorded nothing. Logging at the one place every render invocation
+    // already passes through is the meteredFetch pattern: coverage that
+    // cannot be forgotten by a new call site. Browser-only generators (no
+    // server call) log themselves via `reports/renderEvent.ts`.
+    maybeLogRenderCoverage(functionName, body, data);
 
     return { data: data as T, error: null };
   } catch (error: any) {

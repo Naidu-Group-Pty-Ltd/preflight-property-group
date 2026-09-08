@@ -155,11 +155,17 @@ export function useGHLCalendar() {
   const { toast } = useToast();
   const { addNotification } = useNotifications();
 
+  const lastRangeRef = useRef<{ startTime?: string; endTime?: string; calendarId?: string }>({});
+
   const fetchCalendarData = useCallback(async (
     startTime?: string,
     endTime?: string,
     calendarId?: string
   ) => {
+    // Remember what the view is showing. A newly created appointment has to
+    // be re-read over the SAME window, or it lands outside the range that is
+    // on screen and looks like it was never created.
+    lastRangeRef.current = { startTime, endTime, calendarId };
     setIsLoading(true);
     setError(null);
 
@@ -292,7 +298,7 @@ export function useGHLCalendar() {
     newEndTime: string,
     originalStartTime?: string,
     originalEndTime?: string,
-    options?: { overrideAvailability?: boolean; assignedUserId?: string }
+    options?: { overrideAvailability?: boolean; assignedUserId?: string; notes?: string }
   ): Promise<{ success: boolean; undo?: () => Promise<boolean> }> => {
     setIsUpdating(true);
 
@@ -305,6 +311,10 @@ export function useGHLCalendar() {
       };
       if (options?.overrideAvailability) payload.overrideAvailability = true;
       if (options?.assignedUserId) payload.assignedUserId = options.assignedUserId;
+      // The reschedule form carries notes now (audit item 29): a moved
+      // appointment usually moves for a reason, and the form had nowhere to say
+      // it. `update` has always accepted the field.
+      if (options?.notes !== undefined) payload.notes = options.notes;
 
       const { data, error: updateError } = await invokeSecureFunction('ghl-calendar', payload);
 
@@ -316,10 +326,21 @@ export function useGHLCalendar() {
         // Get the event for notification details
         const event = events.find(e => e.id === eventId);
         
-        // Update local state
-        setEvents(prev => prev.map(event => 
-          event.id === eventId 
-            ? { ...event, startTime: newStartTime, endTime: newEndTime }
+        // Update local state.
+        //
+        // The notes were part of this too and were left out: the server stored
+        // the edited text and the event in memory kept the old one, so
+        // reopening the appointment showed the note the operator had just
+        // replaced — reported as "I changed the notes… it remained with the
+        // original note". Patch what was actually sent.
+        setEvents(prev => prev.map(event =>
+          event.id === eventId
+            ? {
+                ...event,
+                startTime: newStartTime,
+                endTime: newEndTime,
+                ...(options?.notes !== undefined ? { notes: options.notes } : {}),
+              }
             : event
         ));
         
@@ -623,9 +644,19 @@ export function useGHLCalendar() {
       if (data?.success) {
         const newEvent = normalizeEvent(data.event);
         if (newEvent) {
-          // Add to local state
+          // Shown immediately, so the board reacts to the click.
           setEvents((prev) => [...prev, newEvent]);
         }
+
+        // …and then re-read the window from the server. The optimistic add
+        // above is conditional on GoHighLevel returning a complete event, and
+        // its create response frequently does not — `normalizeEvent` answers
+        // null, the branch is skipped silently, and the booking is invisible
+        // until the operator reloads the page. That was the reported defect:
+        // "it doesn't display on the calendar… it displays only after I
+        // refresh". A refetch cannot be skipped by a missing field.
+        const { startTime, endTime, calendarId } = lastRangeRef.current;
+        void fetchCalendarData(startTime, endTime, calendarId);
         
         // Add notification for created appointment
         addNotification({
@@ -656,7 +687,7 @@ export function useGHLCalendar() {
     } finally {
       setIsUpdating(false);
     }
-  }, [toast]);
+  }, [toast, fetchCalendarData]);
 
   const getCalendarColor = useCallback((calendarId: string): string => {
     const calendar = calendars.find(c => c.id === calendarId);

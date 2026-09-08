@@ -7,6 +7,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Separator } from '@/components/ui/separator';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { SearchInput } from '@/components/ui/search-input';
 import {
   Loader2, Users, MessageSquare, Tag, Workflow, RefreshCw,
   Bot, MousePointerClick, Search, User, Clock, Globe,
@@ -340,7 +341,7 @@ export function ManyChatPanel() {
                 </div>
                 <div className="flex items-center justify-between text-xs">
                   <div className="flex items-center gap-1.5">
-                    <CheckCircle2 className="h-3.5 w-3.5 text-success-foreground0" />
+                    <CheckCircle2 className="h-3.5 w-3.5 text-success" />
                     <span className="text-muted-foreground">Active</span>
                     <span className="font-semibold text-foreground">{flowStats.active}</span>
                   </div>
@@ -443,13 +444,14 @@ export function ManyChatPanel() {
             </Select>
           )}
           <div className="flex min-w-0 flex-col gap-2 sm:flex-row">
-            <Input
-              placeholder={searchMode === 'name' ? 'Search by name...' : 'Enter field value...'}
+            <SearchInput
               value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
+              onValueChange={setSearchQuery}
+              placeholder={searchMode === 'name' ? 'Search by name...' : 'Enter field value...'}
               onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
-              className="flex-1 min-w-0"
               aria-label={searchMode === 'name' ? 'Search ManyChat subscribers by name' : 'Search ManyChat subscribers by custom field value'}
+              hideIcon
+              className="flex-1 min-w-0"
             />
             <Button onClick={handleSearch} disabled={isSearching} size="sm" className="shrink-0 rounded-xl focus-visible:ring-primary/45" aria-label="Search ManyChat subscribers">
               {isSearching ? <Loader2 className="h-4 w-4 animate-spin" /> : <Search className="h-4 w-4" />}

@@ -3,9 +3,11 @@ import { verifyAuth, createCorsHeaders } from '../_shared/auth.ts';
 import { requireModulePermission } from '../_shared/authz.ts';
 import { enforceCsrf, csrfDenied } from '../_shared/csrfGuard.ts';
 import { hasCompleteAustralianAddress, resolveCompleteReportAddress } from './report-address.pure.ts';
+import { familyParentId, isBaseReport, shapeFamily } from '../_shared/reports/investment/subReportFamily.pure.ts';
+import { reconcileStoredFinancials } from '../_shared/reports/investment/financialEngine.pure.ts';
 
 type TableName = 'investment_reports' | 'generated_reports' | 'property_comparisons';
-type Projection = 'library' | 'cashFlowLibrary' | 'archivedLibrary' | 'detail' | 'idLookup' | 'multiLookup' | 'generationProgress';
+type Projection = 'library' | 'cashFlowLibrary' | 'cashFlowComparison' | 'archivedLibrary' | 'detail' | 'idLookup' | 'multiLookup' | 'generationProgress';
 type ErrorCode = 'UNAUTHENTICATED' | 'FORBIDDEN' | 'REPORT_SCHEMA_MISMATCH' | 'INVALID_REPORT_QUERY' |
   'REPORT_DATABASE_UNAVAILABLE' | 'REPORT_QUERY_TIMEOUT' | 'REPORT_QUERY_FAILED' | 'REPORT_NOT_FOUND' | 'INTERNAL_REPORT_ERROR';
 
@@ -14,6 +16,8 @@ interface RequestBody {
   projection?: Projection;
   reportId?: string;
   reportIds?: string[];
+  /** Resolve the Compass family (parent + sub-reports + staleness) of this report id. */
+  familyOf?: string;
   listMode?: boolean;
   listOptions?: {
     status?: string | string[]; isArchived?: boolean; isClientReport?: boolean | null;
@@ -40,7 +44,20 @@ interface RequestBody {
 
 export const INVESTMENT_LIBRARY_SELECT = 'id,property_address,property_listing_id,client_property_id,canonical_property_key,created_at,current_version,report_scope,report_tier,parent_report_id,status,is_archived,is_client_report,report_variant,derived_from_report_id,investment_score,generated_by';
 const INVESTMENT_LIBRARY_SOURCE_SELECT = `${INVESTMENT_LIBRARY_SELECT},manual_overrides,financial_calculations`;
-const INVESTMENT_DETAIL_SELECT = `${INVESTMENT_LIBRARY_SELECT},report_content,sources_content,manual_overrides,financial_calculations,demographics_data,economic_data,location_intelligence`;
+// `cashFlowComparison` reads the SAME columns as `cashFlowLibrary` and simply
+// does not collapse them. The two answer different questions: a list needs the
+// headline scalars and nothing more, while a comparison replays the ten-year
+// projection from `financial_calculations` and `manual_overrides` — council
+// rates, insurance, the interest rate, capital growth, the depreciation
+// schedule and every per-year override. Handed the collapsed row it does not
+// fail; it silently defaults to 0 / 5% / 5.5% and renders a plausible
+// projection of nothing, which is the one outcome a comparison must never
+// produce. It is deliberately not the list projection: the payload is large
+// and only the handful of reports actually selected need it.
+// `data_sources` and `validation_flags` ride along for the viewer's
+// data-coverage disclosure: which sources informed the report, which
+// returned nothing, and any prose-vs-record fact contradictions.
+const INVESTMENT_DETAIL_SELECT = `${INVESTMENT_LIBRARY_SELECT},report_content,sources_content,manual_overrides,financial_calculations,demographics_data,economic_data,location_intelligence,data_sources,validation_flags`;
 // Live-progress projection for the floating generation widget, which polls every
 // few seconds. The library projection omits `updated_at`, `error_message` and the
 // section counters, so the widget was rendering `new Date(undefined)` and a
@@ -177,6 +194,55 @@ Deno.serve(async (req) => {
     const permission = await requireModulePermission(supabase, { userId: auth.userId, authMethod: auth.authMethod }, table === 'generated_reports' ? 'generated_reports' : 'reports', 'can_view');
     if (!permission.ok) return failure('FORBIDDEN', 'Report library access is required.', false, 403, corsHeaders, correlationId);
 
+    // ── The Compass family, resolved server-side ──────────────────────────────
+    //
+    // `familyOf` answers "who belongs to this report's package, and is each
+    // child still true to its parent". It exists because the tier switcher
+    // used to read `investment_reports` from the BROWSER, where the
+    // service-role-only policies filter every row: siblings always read as
+    // absent, so switching to an existing child was impossible and every
+    // click regenerated one — the fourth surface to hit the read-through-the-
+    // server trap. History wrote the parent link in two columns (fork wrote
+    // `derived_from_report_id`, condense wrote `parent_report_id`), so
+    // children are the union over both — two indexed lookups, never a
+    // composed `.or()` string. Staleness is derived here, never stored.
+    if (body.familyOf) {
+      if (typeof body.familyOf !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(body.familyOf)) {
+        return failure('INVALID_REPORT_QUERY', 'familyOf must be a report id.', false, 400, corsHeaders, correlationId);
+      }
+      const FAMILY_SELECT = 'id, property_address, status, report_tier, report_variant, parent_report_id, derived_from_report_id, variant_generated_at, updated_at, created_at, is_archived';
+      const anchorRes = await supabase.from('investment_reports').select(FAMILY_SELECT).eq('id', body.familyOf).maybeSingle();
+      if (anchorRes.error) {
+        const mapped = classifyDatabaseError(anchorRes.error);
+        return failure(mapped.code, mapped.details, mapped.retryable, mapped.status, corsHeaders, correlationId);
+      }
+      if (!anchorRes.data) return failure('REPORT_NOT_FOUND', 'No report exists for that ID.', false, 404, corsHeaders, correlationId);
+      const anchor = anchorRes.data as Record<string, unknown>;
+      const parentId = isBaseReport(anchor) ? String(anchor.id) : familyParentId(anchor);
+
+      const rows: Record<string, unknown>[] = [anchor];
+      if (parentId) {
+        const [parentRes, byDerived, byParent] = await Promise.all([
+          parentId === anchor.id
+            ? Promise.resolve({ data: null, error: null })
+            : supabase.from('investment_reports').select(FAMILY_SELECT).eq('id', parentId).maybeSingle(),
+          supabase.from('investment_reports').select(FAMILY_SELECT).eq('derived_from_report_id', parentId),
+          supabase.from('investment_reports').select(FAMILY_SELECT).eq('parent_report_id', parentId),
+        ]);
+        const firstError = parentRes.error || byDerived.error || byParent.error;
+        if (firstError) {
+          const mapped = classifyDatabaseError(firstError);
+          return failure(mapped.code, mapped.details, mapped.retryable, mapped.status, corsHeaders, correlationId);
+        }
+        if (parentRes.data) rows.push(parentRes.data as Record<string, unknown>);
+        for (const row of [...(byDerived.data || []), ...(byParent.data || [])]) rows.push(row as Record<string, unknown>);
+      }
+
+      const family = shapeFamily(String(anchor.id), rows.filter((r) => r.is_archived !== true));
+      console.info('[get-investment-reports]', { correlationId, userId: auth.userId, projection: 'familyOf', childCount: family.children.length, staleCount: family.staleChildren.length, durationMs: Math.round(performance.now() - started), functionVersion: FUNCTION_VERSION });
+      return json({ success: true, family, correlationId }, 200, corsHeaders, correlationId);
+    }
+
     const options = body.listOptions || {};
     if (!validIso(options.createdAfter) || !validIso(options.createdBefore) || (options.createdAfter && options.createdBefore && Date.parse(options.createdAfter) > Date.parse(options.createdBefore)))
       return failure('INVALID_REPORT_QUERY', 'Date filters must be valid ISO timestamps in chronological order.', false, 400, corsHeaders, correlationId);
@@ -184,14 +250,14 @@ Deno.serve(async (req) => {
     if (!Number.isInteger(page) || page < 1 || !Number.isInteger(pageSize) || pageSize < 1 || pageSize > 200)
       return failure('INVALID_REPORT_QUERY', 'Page must be positive and pageSize must be between 1 and 200.', false, 400, corsHeaders, correlationId);
     const projection: Projection = body.projection || (body.reportId ? 'detail' : body.reportIds ? 'multiLookup' : options.isArchived ? 'archivedLibrary' : 'library');
-    const allowed: Projection[] = ['library', 'cashFlowLibrary', 'archivedLibrary', 'detail', 'idLookup', 'multiLookup', 'generationProgress'];
+    const allowed: Projection[] = ['library', 'cashFlowLibrary', 'cashFlowComparison', 'archivedLibrary', 'detail', 'idLookup', 'multiLookup', 'generationProgress'];
     if (!allowed.includes(projection)) return failure('INVALID_REPORT_QUERY', 'The requested projection is invalid.', false, 400, corsHeaders, correlationId);
 
     const select = table === 'investment_reports'
       ? projection === 'detail' ? INVESTMENT_DETAIL_SELECT
         : projection === 'idLookup' ? 'id'
         : projection === 'generationProgress' ? INVESTMENT_PROGRESS_SELECT
-        : projection === 'cashFlowLibrary' ? INVESTMENT_LIBRARY_SOURCE_SELECT
+        : projection === 'cashFlowLibrary' || projection === 'cashFlowComparison' ? INVESTMENT_LIBRARY_SOURCE_SELECT
         : INVESTMENT_LIBRARY_SELECT
       : TABLE_SELECTS[table as Exclude<TableName, 'investment_reports'>];
     let query = supabase.from(table).select(select, { count: 'exact' });
@@ -233,7 +299,7 @@ Deno.serve(async (req) => {
       const keys = [...new Set(responseData.map(row => row.canonical_property_key).filter((key): key is string => Boolean(key)))];
       if (keys.length) {
         let siblingsQuery = supabase.from('investment_reports')
-          .select(projection === 'cashFlowLibrary' ? INVESTMENT_LIBRARY_SOURCE_SELECT : INVESTMENT_LIBRARY_SELECT)
+          .select(projection === 'cashFlowLibrary' || projection === 'cashFlowComparison' ? INVESTMENT_LIBRARY_SOURCE_SELECT : INVESTMENT_LIBRARY_SELECT)
           .in('canonical_property_key', keys);
         siblingsQuery = (projection === 'archivedLibrary' || options.isArchived === true) ? siblingsQuery.eq('is_archived', true) : siblingsQuery.or('is_archived.is.null,is_archived.eq.false');
         siblingsQuery = options.isClientReport === true ? siblingsQuery.eq('is_client_report', true) : siblingsQuery.or('is_client_report.is.null,is_client_report.eq.false');
@@ -252,6 +318,19 @@ Deno.serve(async (req) => {
         const mapped = classifyDatabaseError(hydrated.error); return failure(mapped.code, mapped.details, mapped.retryable, mapped.status, corsHeaders, correlationId);
       }
       responseData = hydrated.rows as typeof responseData;
+    }
+    // Read-boundary heal (audit F26): a row whose stored projections were
+    // folded against triple-charged operating costs is reconciled before it
+    // leaves the service — the same heal the two PDF routes and the binding
+    // projection apply — so browser charts, the library summaries and the
+    // legacy browser generator all read one set of figures. Idempotent on
+    // healthy rows, and it never writes anything back.
+    if (table === 'investment_reports' && responseData.length) {
+      const healed = (responseData as unknown as ReportRow[]).map((r) => {
+        if (!r || typeof r !== 'object' || !r.financial_calculations) return r;
+        return { ...r, financial_calculations: reconcileStoredFinancials(r.financial_calculations).fin };
+      });
+      responseData = healed as unknown as typeof responseData;
     }
     if (table === 'investment_reports' && projection === 'cashFlowLibrary') {
       responseData = responseData.map(row => toLibraryFinancialSummary(row as ReportRow)) as typeof responseData;

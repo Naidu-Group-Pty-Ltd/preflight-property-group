@@ -5,6 +5,15 @@ import { requireWorkspaceCapability, entitlementDeniedResponse } from '../_share
 import { enforceCsrf, csrfDenied } from "../_shared/csrfGuard.ts";
 import { withReportMetering, resolveUserId, buildIdempotencyKey } from '../_shared/reportMetering.ts';
 import { internalError } from '../_shared/errorResponse.ts';
+import { readModelJson } from '../_shared/llmJson.pure.ts';
+import {
+  impactFor,
+  portfolioRateSensitivity,
+  projectPortfolio,
+  readProjectionScenario,
+  sensitivityUnavailableText,
+  type PortfolioLoanInput,
+} from '../_shared/reports/portfolio/deterministicFacts.pure.ts';
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -35,6 +44,10 @@ interface ClientProperty {
   loan_repayment_amount: number | null;
   loan_repayment_frequency: string | null;
   lender_name: string | null;
+  // Fetched by `select('*')` and read by the deterministic facts helper. It
+  // was absent from this interface while the row carried it, which is how the
+  // repayment structure stayed invisible to everything typed.
+  repayment_type: string | null;
 }
 
 interface ClientData {
@@ -57,6 +70,35 @@ interface ClientData {
   net_monthly_cash_flow: number | null;
   borrowing_capacity: number | null;
   equity_release: number | null;
+}
+
+
+/**
+ * Ask for JSON as JSON, and fall back to asking in prose if the provider
+ * refuses the field.
+ *
+ * `compare-investment-reports` learned this the hard way and built a ladder
+ * for it: a provider that cannot do `response_format` answers 4xx naming the
+ * field, and dropping the request is right — but ONLY for that reason. A 429,
+ * a 402 or a 5xx is about capacity, credit or health, and retrying without the
+ * format would answer a question nobody asked. `rungRejected` is that rule,
+ * imported rather than restated.
+ *
+ * Without this, adding `response_format` to a path that is already broken
+ * risks trading a truncated answer for no answer at all. The reader below
+ * handles a fenced response either way, so the fallback loses nothing.
+ */
+async function callForJson(args: Record<string, unknown>) {
+  const { callLLMRaw } = await import('../_shared/llmRouter.ts');
+  const withFormat = await callLLMRaw({ ...args, responseFormat: { type: 'json_object' } } as any);
+  if (withFormat.ok) return withFormat;
+
+  const { rungRejected } = await import('../_shared/reports/propertyComparison/analysisRequest.pure.ts');
+  const body = await withFormat.text().catch(() => '');
+  if (!rungRejected(withFormat.status, body)) return withFormat;
+
+  console.warn('[generate-portfolio-analysis] provider refused response_format; asking in prose');
+  return await callLLMRaw(args as any);
 }
 
 const __portfolioHandler = async (req: Request): Promise<Response> => {
@@ -83,6 +125,15 @@ const __portfolioHandler = async (req: Request): Promise<Response> => {
     const body = await req.json();
     const { 
       clientId,
+      // Audit item 10 — the AI Insights card on a client's AI tab.
+      //
+      // `'insights'` asks for the five short fields that card renders rather
+      // than the fourteen-section review. It reuses everything below it:
+      // the same authentication, the same portfolio-analysis entitlement, the
+      // same server-side assembly of the client's properties and metrics, and
+      // the same metered router call under the same agent key. Default
+      // `'full'`, so every existing caller is untouched.
+      mode = 'full',
       investorProfile = 'general',
       analysisDepth = 'comprehensive',
       includeProjections = true,
@@ -352,10 +403,113 @@ const __portfolioHandler = async (req: Request): Promise<Response> => {
 
     console.log(`📋 Built configContext for prompt injection:`, configContext || '(empty - no investor profile values set)');
 
-    // Calculate growth rate for projections
-    let growthRate = 5; // default
-    if (growthRateAssumption === 'conservative') growthRate = 3.5;
-    else if (growthRateAssumption === 'optimistic') growthRate = 7.5;
+    // ========================================================================
+    // DETERMINISTIC FACTS — computed here, and never asked of the model.
+    //
+    // Everything below comes from the record. The model is given these as
+    // authoritative context and asked to EXPLAIN them; its JSON schema no
+    // longer contains a field for any of them, so there is nothing to
+    // overwrite and nothing to reconcile. See
+    // `docs/reports/PORTFOLIO_TRUST_BOUNDARY.md`.
+    // ========================================================================
+    const toLoanInput = (p: ClientProperty): PortfolioLoanInput => ({
+      loanRemaining: p.loan_remaining,
+      interestRate: p.interest_rate,
+      repaymentType: p.repayment_type,
+      loanRepaymentAmount: p.loan_repayment_amount,
+      loanRepaymentFrequency: p.loan_repayment_frequency,
+    });
+
+    const investmentSensitivity = portfolioRateSensitivity(investmentProperties.map(toLoanInput));
+    const ownerOccupiedSensitivity = portfolioRateSensitivity(ownerOccupiedProperties.map(toLoanInput));
+
+    const projection = projectPortfolio({
+      currentPortfolioValue: portfolioMetrics.totalValue,
+      currentDebt: portfolioMetrics.totalDebt,
+      scenario: readProjectionScenario(growthRateAssumption),
+      horizonYears: projectionYears,
+    });
+    // The prompt has always shown a growth percentage; it now shows the one the
+    // arithmetic used rather than a second copy of the same intent.
+    const growthRate = projection.assumptions.annualCapitalGrowthPercent;
+
+    // Borrowing capacity: the assessment record already holds the deterministic
+    // figures, so the model is not asked to restate them either. Absent
+    // assessment means an absent block, not a zeroed one.
+    const capacityFacts = bcData && Number.isFinite(Number(bcData.borrowing_capacity))
+      ? (() => {
+          const estimated = Number(bcData.borrowing_capacity);
+          const deployed = portfolioMetrics.totalDebt;
+          return {
+            estimatedCapacity: Math.round(estimated),
+            totalDebtDeployed: Math.round(deployed),
+            availableCapacity: Math.round(estimated - deployed),
+            utilisationPercentage: estimated > 0
+              ? Math.round((deployed / estimated) * 100 * 10) / 10
+              : null,
+          };
+        })()
+      : null;
+
+    const money = (n: number) => `$${Math.round(n).toLocaleString('en-AU')}`;
+    const sensitivityLines = (label: string, s: ReturnType<typeof portfolioRateSensitivity>, currentLabel: string, currentValue: number | null) => {
+      if (!s.available) return `${label}: ${sensitivityUnavailableText(s.unavailableReason)}`;
+      return [
+        `${label}:`,
+        `  - ${currentLabel}: ${currentValue === null ? 'not available' : money(currentValue)} per month`,
+        `  - If rates rise 1%: ${money(impactFor(s, 1)!)} per month (negative means worse off)`,
+        `  - If rates rise 2%: ${money(impactFor(s, 2)!)} per month (negative means worse off)`,
+        `  - Covers ${s.loansCovered} loan(s), ${money(s.balanceCovered)} of debt`,
+      ].join('\n');
+    };
+
+    const deterministicFactsBlock = [
+      '**CALCULATED FIGURES — THESE ARE AUTHORITATIVE. EXPLAIN THEM; DO NOT RECALCULATE OR RESTATE THEM AS YOUR OWN NUMBERS.**',
+      'Every dollar amount you quote must come from this block or from the portfolio data above. Do not derive new financial figures.',
+      '',
+      sensitivityLines(
+        'INTEREST RATE SENSITIVITY — investment properties',
+        investmentSensitivity,
+        'Current net monthly cashflow',
+        portfolioMetrics.netMonthlyCashflow,
+      ),
+      sensitivityLines(
+        'INTEREST RATE SENSITIVITY — owner-occupied properties',
+        ownerOccupiedSensitivity,
+        'Current monthly repayment',
+        ownerOccupiedSensitivity.currentMonthlyRepayment,
+      ),
+      '',
+      `${projectionYears}-YEAR PROJECTION (${projection.assumptions.scenario} scenario):`,
+      projection.projectedPortfolioValue === null
+        ? '  - Not available: the portfolio has no recorded value.'
+        : [
+            `  - Projected portfolio value: ${money(projection.projectedPortfolioValue)}`,
+            projection.projectedEquity === null
+              ? '  - Projected equity: not available (debt not recorded)'
+              : `  - Projected equity: ${money(projection.projectedEquity)}`,
+            '  - Projected monthly cashflow: NOT PROJECTED. No rent or expense growth rate is recorded for this portfolio. Do not estimate one.',
+            ...projection.assumptions.statements.map((s) => `  - Assumption: ${s}`),
+          ].join('\n'),
+      '',
+      capacityFacts === null
+        ? 'BORROWING CAPACITY: no assessment on record. Do not estimate a capacity.'
+        : [
+            'BORROWING CAPACITY UTILISATION:',
+            `  - Estimated capacity: ${money(capacityFacts.estimatedCapacity)}`,
+            `  - Debt deployed: ${money(capacityFacts.totalDebtDeployed)}`,
+            `  - Available: ${money(capacityFacts.availableCapacity)}`,
+            capacityFacts.utilisationPercentage === null
+              ? '  - Utilisation: not available'
+              : `  - Utilisation: ${capacityFacts.utilisationPercentage}%`,
+          ].join('\n'),
+    ].join('\n');
+
+    console.log(
+      `📊 Deterministic facts — investment sensitivity: ${investmentSensitivity.available ? 'available' : investmentSensitivity.unavailableReason}; `
+      + `owner-occupied: ${ownerOccupiedSensitivity.available ? 'available' : ownerOccupiedSensitivity.unavailableReason}; `
+      + `projection: ${projection.assumptions.scenario} ${growthRate}% over ${projectionYears}y`,
+    );
 
     // --- Build supplementary data sections for the prompt ---
 
@@ -471,6 +625,122 @@ const __portfolioHandler = async (req: Request): Promise<Response> => {
     }
 
     // Build AI analysis prompt
+    // ── Audit item 10: the AI Insights card ───────────────────────────────
+    //
+    // "Generate AI Insights" answered `Failed to generate insights: Not found`
+    // for everyone, every time, and had never once worked. The card composed
+    // its whole prompt in the browser and posted it to `report-qa` with
+    // `action: 'chat'` — an action whose policy is `access: 'write'`, meaning
+    // it authorises against a Report Q&A CONVERSATION. The card has no
+    // conversation, so `if (!conversationId) return denyResponse()` answered
+    // 404, and 404 is deliberate there: a caller must not be able to tell a
+    // conversation they cannot reach from one that does not exist. A correct
+    // refusal, to a question that should never have been asked of it.
+    //
+    // Two things were wrong beyond the 404. A card on the Clients page
+    // required the unrelated `report_qa` module permission and spent Report
+    // Q&A's shared paid quota (30/hour). And the prompt was assembled by the
+    // browser, so the endpoint was being used as a free-text model proxy.
+    //
+    // Both go away here: this function already authorises the CLIENT, already
+    // reads the portfolio from the database, and already meters under
+    // `portfolio_analysis`. The browser now sends a client id and nothing
+    // else.
+    if (mode === 'insights') {
+      const topProperties = ownedProperties.slice(0, 12).map((p) => ({
+        address: p.address,
+        value: Number(p.value) || 0,
+        loan: Number(p.loan_remaining) || 0,
+        monthlyRent: Number(p.monthly_rental_income) || 0,
+        netMonthlyCashflow: Number(p.net_monthly_cashflow) || 0,
+        type: p.property_type,
+      }));
+
+      const insightsPrompt = `Analyse this Australian property investment portfolio.
+
+Client: ${client.primary_first_name ?? ''} ${client.primary_surname ?? ''}
+Properties: ${portfolioMetrics.totalProperties} (${portfolioMetrics.investmentCount} investment, ${portfolioMetrics.ownerOccupiedCount} owner-occupied)
+Portfolio value: $${Math.round(portfolioMetrics.totalValue).toLocaleString('en-AU')}
+Total debt: $${Math.round(portfolioMetrics.totalDebt).toLocaleString('en-AU')}
+Equity: $${Math.round(portfolioMetrics.totalEquity).toLocaleString('en-AU')}
+Average LVR: ${portfolioMetrics.averageLVR.toFixed(1)}%
+Average gross yield: ${portfolioMetrics.averageYield.toFixed(2)}%
+Net monthly cash flow: $${Math.round(portfolioMetrics.netMonthlyCashflow).toLocaleString('en-AU')}
+
+Properties:
+${topProperties.map((p) => `- ${p.address} (${p.type}): value $${p.value.toLocaleString('en-AU')}, loan $${p.loan.toLocaleString('en-AU')}, rent $${p.monthlyRent.toLocaleString('en-AU')}/mo, net $${p.netMonthlyCashflow.toLocaleString('en-AU')}/mo`).join('\n') || '- none recorded'}
+
+Respond with ONLY this JSON:
+{
+  "summary": "2-3 sentence overall assessment",
+  "strengths": ["strength 1", "strength 2", "strength 3"],
+  "opportunities": ["opportunity 1", "opportunity 2"],
+  "risks": ["risk 1", "risk 2"],
+  "recommendations": ["recommendation 1", "recommendation 2", "recommendation 3"]
+}`;
+
+      const insightsResponse = await callForJson({
+        agentKey: 'portfolio_analysis',
+        messages: [
+          {
+            role: 'system',
+            content: (await (await import('../_shared/engine-prompts.ts')).resolvePrompt('portfolio_analysis.system')).text,
+          },
+          { role: 'user', content: insightsPrompt },
+        ],
+        temperature: 0.7,
+        // 1,200 was sized for the five short fields this card renders, which
+        // was right for the answer and wrong for the call: `gemini-2.5-pro` is
+        // a REASONING model and its thinking is billed as completion tokens,
+        // spent before a character of the answer is written. Production spent
+        // 1,196 of 1,200 and produced 184 characters — one truncated sentence.
+        maxTokens: 4000,
+      });
+
+      if (!insightsResponse.ok) {
+        const detail = await insightsResponse.text();
+        console.error('[generate-portfolio-analysis] insights model error:', insightsResponse.status, detail);
+        return new Response(
+          JSON.stringify(
+            insightsResponse.status === 429
+              ? { error: 'Rate limit exceeded', details: 'Please wait and try again.' }
+              : { error: 'AI analysis failed', details: detail },
+          ),
+          {
+            status: insightsResponse.status === 429 ? 429 : 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          },
+        );
+      }
+
+      const insightsData = await insightsResponse.json();
+      const insightsText = insightsData.choices?.[0]?.message?.content ?? '';
+      // `readModelJson` rather than a fence regex of our own. The regex here
+      // required a CLOSING fence, so a cut-off answer — which has neither a
+      // closing fence nor a closing brace — fell through to a raw match that
+      // could not succeed either, and the operator was told the model had not
+      // answered in JSON when it had, and had simply been stopped mid-word.
+      const insightsRead = readModelJson<Record<string, unknown>>(
+        insightsText,
+        insightsData.choices?.[0]?.finish_reason,
+      );
+      if (!insightsRead.ok) {
+        console.error(
+          `[generate-portfolio-analysis] insights ${insightsRead.reason}:`,
+          insightsText.slice(0, 400),
+        );
+        return new Response(
+          JSON.stringify({ error: insightsRead.message, reason: insightsRead.reason }),
+          { status: 502, headers: { ...corsHeaders, 'Content-Type': 'application/json' } },
+        );
+      }
+
+      return new Response(
+        JSON.stringify({ success: true, insights: insightsRead.value }),
+        { headers: { ...corsHeaders, 'Content-Type': 'application/json' } },
+      );
+    }
+
     const prompt = `You are an expert Australian property portfolio analyst and trusted advisor. Analyze this client's entire property portfolio and provide a comprehensive, consultative analysis that builds trust and demonstrates expertise.
 
 **CLIENT & HOUSEHOLD INFORMATION:**
@@ -522,6 +792,8 @@ ${JSON.stringify(propertyAnalyses, null, 2)}
 
 **ANALYSIS REQUIREMENTS:**
 Provide a comprehensive, consultative portfolio analysis. The tone should be warm, professional, and trust-building — as if you are part of the client's dedicated property advisory team preparing a personalised review. CRITICAL: Always use "we/our/us" framing (e.g. "We are pleased to present...", "Our team has reviewed...", "We recommend..."). NEVER use first-person singular "I/my" — this report is sent on behalf of a team, not an individual. Justify every assessment with data-driven reasoning. Even for underperforming portfolios, frame findings constructively with clear pathways to improvement.
+
+${deterministicFactsBlock}
 
 Provide analysis with these sections:
 
@@ -594,16 +866,10 @@ Format your response as valid JSON with this structure:
   },
   "interestRateSensitivity": {
     "investmentProperties": {
-      "currentMonthlyCashflow": number,
-      "plusOnePercentImpact": number,
-      "plusTwoPercentImpact": number,
-      "commentary": "string (plain English explanation of what rate rises mean for rental income vs expenses)"
+      "commentary": "string (plain English explanation of what rate rises mean for rental income vs expenses. Use ONLY the calculated figures supplied above; if they are unavailable, say so plainly and do not estimate)"
     },
     "ownerOccupiedProperties": {
-      "currentMonthlyRepayment": number,
-      "plusOnePercentImpact": number,
-      "plusTwoPercentImpact": number,
-      "commentary": "string (plain English explanation of what rate rises mean for home loan repayments)"
+      "commentary": "string (plain English explanation of what rate rises mean for home loan repayments. Use ONLY the calculated figures supplied above; if they are unavailable, say so plainly and do not estimate)"
     },
     "combinedCommentary": "string (overall summary in plain English)"
   },
@@ -620,23 +886,14 @@ Format your response as valid JSON with this structure:
     "optimizationStrategies": ["string"]
   },
   "projections": {
-    "years": number,
-    "projectedPortfolioValue": number,
-    "projectedEquity": number,
-    "projectedMonthlyCashflow": number,
-    "assumptions": ["string"],
-    "plainEnglishSummary": "string (2-3 sentences explaining what these projections mean in everyday language for the client)"
+    "plainEnglishSummary": "string (2-3 sentences explaining what the SUPPLIED projection figures mean in everyday language for the client. Quote only the calculated values given above. Do not state a projected cashflow — none is calculated)"
   },
   "actionPlan": {
     "twelveMonthActions": ["string (concrete, prioritised actions)"],
     "optimisationScenarios": ["string (if-then improvement scenarios with dollar amounts)"]
   },
   "borrowingCapacityUtilisation": {
-    "totalDebtDeployed": number,
-    "estimatedCapacity": number,
-    "availableCapacity": number,
-    "utilisationPercentage": number,
-    "commentary": "string"
+    "commentary": "string (interpret the supplied capacity figures; if no assessment is on record, say so and do not estimate a capacity)"
   },
   "strategicRecommendations": {
     "shortTerm": ["string"],
@@ -647,9 +904,8 @@ Format your response as valid JSON with this structure:
 }`;
 
     // Call Lovable AI
-    const { callLLMRaw } = await import('../_shared/llmRouter.ts');
     console.log('Calling LLM router for portfolio analysis...');
-    const aiResponse = await callLLMRaw({
+    const aiResponse = await callForJson({
       agentKey: 'portfolio_analysis',
       messages: [
         {
@@ -659,7 +915,12 @@ Format your response as valid JSON with this structure:
         { role: 'user', content: prompt },
       ],
       temperature: 0.7,
-      maxTokens: 8000,
+      // Same reasoning-model arithmetic as the insights call above: 8,000 was
+      // sized for a fourteen-section document and production spent 7,996 of it
+      // — four short of the ceiling on every run — because the model's own
+      // thinking is billed against the same budget. `request_timeout` is
+      // raised alongside this, because a longer answer is a longer call.
+      maxTokens: 14000,
     });
 
     if (!aiResponse.ok) {
@@ -682,22 +943,116 @@ Format your response as valid JSON with this structure:
     const aiData = await aiResponse.json();
     const analysisText = aiData.choices[0].message.content;
 
-    // Parse JSON response
-    let analysis;
-    try {
-      let jsonString = analysisText;
-      const jsonMatch = analysisText.match(/\`\`\`(?:json)?\s*\n([\s\S]*?)\n\`\`\`/);
-      if (jsonMatch) {
-        jsonString = jsonMatch[1];
-      }
-      analysis = JSON.parse(jsonString);
-    } catch (parseError) {
-      console.error('Failed to parse AI response:', parseError);
-      console.log('Raw response:', analysisText);
+    // Parse JSON response.
+    //
+    // This was `JSON.parse` behind a fence regex that required a CLOSING
+    // fence. Every answer in production arrived truncated, so the regex never
+    // matched, the raw ```json text went to `JSON.parse`, and the function
+    // threw `Unexpected token '`'` — a crash rather than a refusal, which is
+    // why the button reported a bare 500 with nothing to act on.
+    const analysisRead = readModelJson<Record<string, unknown>>(
+      analysisText,
+      aiData.choices?.[0]?.finish_reason,
+    );
+    if (!analysisRead.ok) {
+      console.error(`[generate-portfolio-analysis] analysis ${analysisRead.reason}`);
+      console.log('Raw response:', String(analysisText).slice(0, 1000));
       return new Response(
-        JSON.stringify({ error: 'Failed to parse analysis results' }),
-        { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        JSON.stringify({ error: analysisRead.message, reason: analysisRead.reason }),
+        { status: 502, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
+    }
+    const analysis = analysisRead.value as any;
+
+    // ========================================================================
+    // CONTROLLED FINAL ASSEMBLY
+    //
+    // The model's schema no longer contains any of these fields, so nothing is
+    // being overwritten — the deterministic values are simply written into the
+    // persisted shape that existing consumers read. Model prose is carried
+    // through untouched beside them.
+    //
+    // The stored shape is deliberately unchanged: `PortfolioAnalysisPDFGenerator`
+    // reads `analysis.interestRateSensitivity.investmentProperties.*` and
+    // `normalise.pure.ts` reads `analysis.projections.*`. What changed is who
+    // produces the numbers, not where they live.
+    //
+    // `null` means the record could not establish the figure. It is never a
+    // zero — a zeroed rate shock reads as "rates rising costs you nothing".
+    // ========================================================================
+    const modelSensitivity = (analysis?.interestRateSensitivity ?? {}) as any;
+    analysis.interestRateSensitivity = {
+      investmentProperties: {
+        // ONE authority for this figure: the portfolio metric computed above.
+        // The model used to transcribe it, and on one stored report was $492
+        // a month out from the value sitting beside it in the same object.
+        currentMonthlyCashflow: portfolioMetrics.netMonthlyCashflow,
+        plusOnePercentImpact: impactFor(investmentSensitivity, 1),
+        plusTwoPercentImpact: impactFor(investmentSensitivity, 2),
+        available: investmentSensitivity.available,
+        unavailableReason: investmentSensitivity.unavailableReason,
+        unavailableExplanation: investmentSensitivity.available
+          ? null
+          : sensitivityUnavailableText(investmentSensitivity.unavailableReason),
+        loansCovered: investmentSensitivity.loansCovered,
+        balanceCovered: investmentSensitivity.balanceCovered,
+        commentary: typeof modelSensitivity?.investmentProperties?.commentary === 'string'
+          ? modelSensitivity.investmentProperties.commentary : '',
+      },
+      ownerOccupiedProperties: {
+        currentMonthlyRepayment: ownerOccupiedSensitivity.currentMonthlyRepayment,
+        plusOnePercentImpact: impactFor(ownerOccupiedSensitivity, 1),
+        plusTwoPercentImpact: impactFor(ownerOccupiedSensitivity, 2),
+        available: ownerOccupiedSensitivity.available,
+        unavailableReason: ownerOccupiedSensitivity.unavailableReason,
+        unavailableExplanation: ownerOccupiedSensitivity.available
+          ? null
+          : sensitivityUnavailableText(ownerOccupiedSensitivity.unavailableReason),
+        loansCovered: ownerOccupiedSensitivity.loansCovered,
+        balanceCovered: ownerOccupiedSensitivity.balanceCovered,
+        commentary: typeof modelSensitivity?.ownerOccupiedProperties?.commentary === 'string'
+          ? modelSensitivity.ownerOccupiedProperties.commentary : '',
+      },
+      combinedCommentary: typeof modelSensitivity?.combinedCommentary === 'string'
+        ? modelSensitivity.combinedCommentary : '',
+    };
+
+    analysis.projections = {
+      years: projection.assumptions.horizonYears,
+      projectedPortfolioValue: projection.projectedPortfolioValue,
+      projectedDebt: projection.projectedDebt,
+      projectedEquity: projection.projectedEquity,
+      // Never projected — no rent or expense growth rate is recorded, and
+      // capital growth is not rental growth.
+      projectedMonthlyCashflow: null,
+      // The assumptions shown are the assumptions used, from one object.
+      assumptions: projection.assumptions.statements,
+      assumptionDetail: projection.assumptions,
+      plainEnglishSummary: typeof analysis?.projections?.plainEnglishSummary === 'string'
+        ? analysis.projections.plainEnglishSummary : '',
+    };
+
+    analysis.borrowingCapacityUtilisation = capacityFacts === null
+      ? null
+      : {
+          ...capacityFacts,
+          commentary: typeof analysis?.borrowingCapacityUtilisation?.commentary === 'string'
+            ? analysis.borrowingCapacityUtilisation.commentary : '',
+        };
+
+    // Score bounds — the two figures the model IS the authority for. A score
+    // outside 0-100 is not a judgement this product can render, so it is
+    // dropped rather than clamped: clamping 250 to 100 would publish an
+    // excellent rating the model never gave.
+    const boundedScore = (v: unknown): number | null => {
+      const n = typeof v === 'number' ? v : Number(v);
+      return Number.isFinite(n) && n >= 0 && n <= 100 ? Math.round(n) : null;
+    };
+    if (analysis?.executiveSummary) {
+      analysis.executiveSummary.healthScore = boundedScore(analysis.executiveSummary.healthScore);
+    }
+    if (analysis?.compositionAnalysis) {
+      analysis.compositionAnalysis.diversificationScore = boundedScore(analysis.compositionAnalysis.diversificationScore);
     }
 
     const processingTime = Date.now() - startTime;

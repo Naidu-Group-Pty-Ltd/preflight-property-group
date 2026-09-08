@@ -37,6 +37,7 @@ import {
   servableClearanceFor, servableDerivativeFor, type SanitizedDerivative,
 } from './sanitizedDerivative.pure.ts';
 import { PROCESSED_LIFECYCLE } from './stockLifecycle.pure.ts';
+import { readAllRows } from './pagedRead.ts';
 
 /** The stage whose provenance is the builder's own document. */
 export const SOURCE_SUPPLIED_STAGE = 'uploaded_document';
@@ -371,6 +372,36 @@ function awaitingVerdict(image: DisplayableImage): boolean {
  *
  * `skipped` is reported rather than swallowed: a caller that keeps seeing a
  * non-zero count is being told its backfill has not converged.
+ *
+ * IT RANKS WITH `chooseCardImage`, THE SAME AUTHORITY EVERY OTHER WRITER USES,
+ * AND THAT IS THE WHOLE OF THE FIX HERE.
+ *
+ * It used to rank with `chooseDisplayableImage` — the builder's own file or
+ * nothing — because that WAS the rule when this was written, and the comment at
+ * its live call site still says what it was for: "a property whose builder
+ * supplied nothing must end the run with no primary image rather than the
+ * Street View it had before the rule changed". The rule then changed back the
+ * other way. `imagePriority.pure.ts` replaced "builder or nothing" with a
+ * ranking that admits a web photograph VERIFIED to be this property (tier 3)
+ * and Street View of this exact address (tier 4), and `chooseAndStorePrimaryImage`
+ * thirty lines above moved onto it. This function did not, so it went on
+ * enforcing the repealed rule — and the pointers it deletes are exactly the
+ * ones the current rule creates.
+ *
+ * MEASURED IN PRODUCTION, 1 SEPTEMBER 2026, against the 430 live pointers:
+ * 156 `google_maps` and 7 `internet_search` rows fail
+ * `isDisplayableSourceImage` on its first condition (the stage), and 25
+ * `uploaded_document` rows written before roles existed fail it on the role.
+ * 188 of 430 cards — 44% of the marketplace — blanked by one pass, and NOT
+ * caught by the skip guard: `awaitingVerdict` returns false at the same two
+ * gates, so an item it can never rescue is an item it hands straight to the
+ * clear. This is not theoretical: it ran once, and 45 pointers went.
+ *
+ * The guard below is deliberately kept. `chooseCardImage` would demote an item
+ * whose builder image is still awaiting its verdict to a Street View and
+ * promote it back when the verdict lands, which is churn on a card rather than
+ * data loss — but skipping is the conservative answer and it is the one this
+ * function already gave.
  */
 export async function enforceStrictPrimaryImages(
   db: any,
@@ -378,28 +409,70 @@ export async function enforceStrictPrimaryImages(
 ): Promise<{ inspected: number; cleared: number; corrected: number; skipped: number }> {
   const outcome = { inspected: 0, cleared: 0, corrected: 0, skipped: 0 };
 
-  const { data: items } = await db
-    .from('builder_stock_items')
-    .select('id, primary_image_id')
-    .eq('organisation_id', organisationId)
-    .in('lifecycle_status', PROCESSED_LIFECYCLE)
-    .limit(20000);
-  if (!items?.length) return outcome;
+  /*
+   * BOTH READS ARE PAGED, AND A SHORT ANSWER STOPS THE SWEEP DEAD.
+   *
+   * `.limit(20000)` and `.limit(200000)` were never honoured: PostgREST caps a
+   * response at `db-max-rows` — 1,000 on this deployment — and says so only in
+   * a header nothing here reads. The organisation held 1,926 images, the sweep
+   * saw 1,000, and every property whose photograph sat in the missing 926
+   * reached `chooseCardImage([])` and had its pointer CLEARED as "nothing to
+   * show". Eleven properties holding an eligible builder photograph, all of it
+   * past the cut, all of them blank. See `pagedRead.ts`.
+   *
+   * And an incomplete read now RETURNS rather than proceeding. This function's
+   * entire output is deletions and corrections computed from the images it can
+   * see, so reading fewer than all of them is not a smaller sweep — it is a
+   * sweep that blanks every card whose evidence it failed to load. The old code
+   * discarded `error` outright, which made a database fault indistinguishable
+   * from an organisation that owns no images at all.
+   */
+  const itemPage = await readAllRows<{ id: string; primary_image_id: string | null }>(
+    () => db
+      .from('builder_stock_items')
+      .select('id, primary_image_id')
+      .eq('organisation_id', organisationId)
+      .in('lifecycle_status', PROCESSED_LIFECYCLE)
+      .order('id', { ascending: true }));
+  if (itemPage.failed) {
+    console.error('[builderStock] primary-image sweep skipped: items could not be read', {
+      phase: 'enforce_primary_images', organisation_id: organisationId,
+      detail: String((itemPage.error as { message?: string })?.message ?? itemPage.error),
+    });
+    return outcome;
+  }
+  const items = itemPage.rows;
+  if (!items.length) return outcome;
 
-  const { data: images } = await db
-    .from('builder_stock_item_images')
-    .select('id, stock_item_id, source_stage, verification_status, processing_status, position, storage_path, external_url, source_detail')
-    .eq('organisation_id', organisationId)
-    .limit(200000);
+  const imagePage = await readAllRows<DisplayableImage & { stock_item_id: string }>(
+    () => db
+      .from('builder_stock_item_images')
+      .select('id, stock_item_id, source_stage, verification_status, processing_status, position, storage_path, external_url, source_detail')
+      .eq('organisation_id', organisationId)
+      .order('id', { ascending: true }));
+  if (imagePage.failed) {
+    console.error('[builderStock] primary-image sweep skipped: images could not be read', {
+      phase: 'enforce_primary_images', organisation_id: organisationId,
+      detail: String((imagePage.error as { message?: string })?.message ?? imagePage.error),
+    });
+    return outcome;
+  }
+  const images = imagePage.rows;
+
+  /*
+   * Lazily, for the reason `chooseAndStorePrimaryImage` gives above: this
+   * module and `imagePriority.pure.ts` would otherwise import each other.
+   */
+  const { chooseCardImage } = await import('./imagePriority.pure.ts');
 
   const byItem = new Map<string, DisplayableImage[]>();
-  for (const image of (images ?? []) as Array<DisplayableImage & { stock_item_id: string }>) {
+  for (const image of images) {
     const bucket = byItem.get(image.stock_item_id) ?? [];
     bucket.push(image);
     byItem.set(image.stock_item_id, bucket);
   }
 
-  for (const item of items as Array<{ id: string; primary_image_id: string | null }>) {
+  for (const item of items) {
     outcome.inspected += 1;
     const candidates = byItem.get(item.id) ?? [];
 
@@ -411,8 +484,7 @@ export async function enforceStrictPrimaryImages(
       continue;
     }
 
-    const chosen = chooseDisplayableImage(candidates);
-    const next = chosen?.id ?? null;
+    const next = chooseCardImage(candidates)?.image.id ?? null;
     if (next === item.primary_image_id) continue;
 
     await db.from('builder_stock_items')

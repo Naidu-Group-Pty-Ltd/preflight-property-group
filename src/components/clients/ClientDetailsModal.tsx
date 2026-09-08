@@ -67,6 +67,7 @@ import { BorrowingCapacityCard, BorrowingCapacityModal } from '@/components/borr
 import { ClientCommercialIndustrialTab } from './ClientCommercialIndustrialTab';
 import { ClientCommercialIndustrialSnapshot } from './ClientCommercialIndustrialSnapshot';
 import { ClientAIInsights } from './ClientAIInsights';
+import { PORTFOLIO_REPORT_LABEL } from '@/lib/reports/portfolio/label';
 import { ClientFormaraUpload } from './ClientFormaraUpload';
 import { ClientFormaraForms } from './ClientFormaraForms';
 import { PropertyManualEntry } from './PropertyManualEntry';
@@ -150,6 +151,9 @@ export function ClientDetailsModal({ client, open, onOpenChange, initialTab, ini
   const tabOrder = useMemo(() => visibleTabs.map((tab) => tab.value), [visibleTabs]);
   const [showEmailCompose, setShowEmailCompose] = useState(false);
   const [pdfAttachment, setPdfAttachment] = useState<{ blob: Blob; fileName: string } | null>(null);
+  // Who the composed email is addressed to, when that is not the client.
+  // Cleared when the dialog closes so the next send cannot inherit it.
+  const [emailRecipient, setEmailRecipient] = useState<{ name: string; email: string } | null>(null);
   const [isPreparingPortfolio, setIsPreparingPortfolio] = useState(false);
   const [isSendPortfolioModalOpen, setIsSendPortfolioModalOpen] = useState(false);
   const [portfolioAnalysisConfig, setPortfolioAnalysisConfig] = useState<PortfolioAnalysisSettings>(DEFAULT_SETTINGS);
@@ -220,8 +224,22 @@ export function ClientDetailsModal({ client, open, onOpenChange, initialTab, ini
   );
 
   // Handle PDF email callback (for finance)
-  const handlePdfEmailClick = (pdfBlob: Blob, fileName: string) => {
+  /**
+   * Audit item 12 — a PDF, and who it is for.
+   *
+   * This used to take the document alone, so the compose window fell back to
+   * the client on every path. Two of them reach it: the client-details
+   * download (which passes no recipient and stays addressed to the client)
+   * and "Send to Finance → Compose Email with PDF" (which now asks who first,
+   * through the same picker "Quick Send" uses).
+   */
+  const handlePdfEmailClick = (
+    pdfBlob: Blob,
+    fileName: string,
+    recipient?: { name: string; email: string },
+  ) => {
     setPdfAttachment({ blob: pdfBlob, fileName });
+    setEmailRecipient(recipient ?? null);
     setShowEmailCompose(true);
     toast.success('PDF attached to email');
   };
@@ -319,12 +337,13 @@ export function ClientDetailsModal({ client, open, onOpenChange, initialTab, ini
       )}>
 
         {/*
-          First in the toolbar, beside the two buttons that already produce this
-          document rather than instead of them. It offers the same three
-          destinations — save, attach to an email, send through the Finance
-          Portal — and what arrives is selectable text rather than a stack of
-          page images. The server reads the record itself, so this needs only
-          the id.
+          First in the toolbar, and the document's one primary control since
+          the legacy consolidation. It offers the same three destinations —
+          save, attach to an email, send through the Finance Portal — and what
+          arrives is selectable text rather than a stack of page images. The
+          server reads the record itself, so this needs only the id. The two
+          legacy raster buttons survive at the end of the toolbar with their
+          layout named.
         */}
         {can(CLIENT_ACTION_CAPABILITIES.downloadPdf) && (
           <ClientDetailsDownloadButton
@@ -334,38 +353,13 @@ export function ClientDetailsModal({ client, open, onOpenChange, initialTab, ini
           />
         )}
 
-        {can(CLIENT_ACTION_CAPABILITIES.sendToFinance) && (
-          <FormaraPDFGenerator
-            data={{
-              client: (fullClient || {
-                id: client.id,
-                primary_first_name: client.primary_first_name,
-                primary_surname: client.primary_surname,
-                primary_email: client.primary_email,
-                primary_mobile: client.primary_mobile,
-              }) as any,
-              properties: properties as any[],
-              employment: employment as any[],
-              income: income as any[],
-              incomeSources: incomeSources as any[],
-              assets: assets as any[],
-              liabilities: liabilities as any[],
-              expenses: expenses as any[],
-            }}
-            clientName={`${client.primary_first_name} ${client.primary_surname}`}
-            onEmailClick={handlePdfEmailClick}
-            buttonLabel={isMobile ? "Finance" : "Send to Finance"}
-            variant="default"
-          />
-        )}
-
         {can(CLIENT_ACTION_CAPABILITIES.review) && (
           <Button
             variant="outline"
             size="sm"
             onClick={() => setShowReviewWizard(true)}
             disabled={properties.length === 0}
-            title={properties.length === 0 ? 'Add properties to start a review' : 'Start portfolio review wizard'}
+            title={properties.length === 0 ? 'Add properties to start a review' : `Start the ${PORTFOLIO_REPORT_LABEL} wizard`}
           >
             <ClipboardCheck className="h-4 w-4 mr-1.5" />
             <span className={isMobile ? "text-xs" : ""}>Review</span>
@@ -377,19 +371,6 @@ export function ClientDetailsModal({ client, open, onOpenChange, initialTab, ini
             clientId={client.id}
             clientName={`${client.primary_first_name} ${client.primary_surname}`}
             onComplete={() => queryClient.invalidateQueries({ queryKey: ['portfolio-analysis-reports', client.id] })}
-          />
-        )}
-
-        {can(CLIENT_ACTION_CAPABILITIES.downloadPdf) && (
-          <FormaraPDFGenerator
-            data={{
-              client: (fullClient || client) as any,
-              properties: properties as any[], employment: employment as any[], income: income as any[], incomeSources: incomeSources as any[],
-              assets: assets as any[], liabilities: liabilities as any[], expenses: expenses as any[],
-            }}
-            clientName={`${client.primary_first_name} ${client.primary_surname}`}
-            buttonLabel={isMobile ? 'Download PDF' : 'Download Client Details PDF'}
-            action="download"
           />
         )}
 
@@ -433,6 +414,54 @@ export function ClientDetailsModal({ client, open, onOpenChange, initialTab, ini
             clientId={client.id}
             isActive={clientIsActive}
             compact={isMobile}
+          />
+        )}
+
+        {/*
+          The legacy raster generator, demoted to the end of the toolbar with
+          its layout named. The typeset control above owns all three
+          destinations now; these stay because the raster document has
+          capabilities the typeset one does not carry (the owner-occupied
+          summary toggle, the borrowing-capacity appendix) and because a
+          partner's workflow may depend on the exact document. Hidden behind
+          the unified delivery, never deleted — the legacy-consolidation rule.
+        */}
+        {can(CLIENT_ACTION_CAPABILITIES.sendToFinance) && (
+          <FormaraPDFGenerator
+            data={{
+              client: (fullClient || {
+                id: client.id,
+                primary_first_name: client.primary_first_name,
+                primary_surname: client.primary_surname,
+                primary_email: client.primary_email,
+                primary_mobile: client.primary_mobile,
+              }) as any,
+              properties: properties as any[],
+              employment: employment as any[],
+              income: income as any[],
+              incomeSources: incomeSources as any[],
+              assets: assets as any[],
+              liabilities: liabilities as any[],
+              expenses: expenses as any[],
+            }}
+            clientName={`${client.primary_first_name} ${client.primary_surname}`}
+            onEmailClick={handlePdfEmailClick}
+            buttonLabel={isMobile ? "Finance (legacy)" : "Send to Finance (legacy layout)"}
+            variant="ghost"
+          />
+        )}
+
+        {can(CLIENT_ACTION_CAPABILITIES.downloadPdf) && (
+          <FormaraPDFGenerator
+            data={{
+              client: (fullClient || client) as any,
+              properties: properties as any[], employment: employment as any[], income: income as any[], incomeSources: incomeSources as any[],
+              assets: assets as any[], liabilities: liabilities as any[], expenses: expenses as any[],
+            }}
+            clientName={`${client.primary_first_name} ${client.primary_surname}`}
+            buttonLabel={isMobile ? 'Download (legacy)' : 'Download (legacy layout)'}
+            action="download"
+            variant="ghost"
           />
         )}
 
@@ -922,6 +951,7 @@ export function ClientDetailsModal({ client, open, onOpenChange, initialTab, ini
               <ClientSentReportsTab
                 clientId={client.id}
                 clientName={`${client.primary_first_name} ${client.primary_surname}`}
+                properties={properties}
               />
             </TabsContent>
 
@@ -1111,17 +1141,19 @@ export function ClientDetailsModal({ client, open, onOpenChange, initialTab, ini
           if (!open) {
             setPortfolioEmailSubject('');
             setPortfolioEmailBody('');
+            setEmailRecipient(null);
           }
         }}
         clientId={client.id}
         clientEmail={client.primary_email}
+        recipient={emailRecipient}
         clientName={`${client.primary_first_name} ${client.primary_surname}`}
         defaultSubject={portfolioEmailSubject || undefined}
         defaultBody={portfolioEmailBody || undefined}
         inlineAttachment={pdfAttachment}
       />
 
-      {/* Portfolio Review Wizard */}
+      {/* Portfolio Analysis Wizard */}
       <ReviewWizard
         clientId={client.id}
         clientName={`${client.primary_first_name} ${client.primary_surname}`}
@@ -1132,7 +1164,7 @@ export function ClientDetailsModal({ client, open, onOpenChange, initialTab, ini
         onComplete={(reviewId) => {
           setShowReviewWizard(false);
           refetchClient();
-          toast.success('Portfolio review completed successfully');
+          toast.success(`${PORTFOLIO_REPORT_LABEL} completed successfully`);
         }}
       />
 
@@ -1156,6 +1188,10 @@ export function ClientDetailsModal({ client, open, onOpenChange, initialTab, ini
           current_address: fullClient?.current_address,
           secondary_first_name: fullClient?.secondary_first_name,
           secondary_surname: fullClient?.secondary_surname,
+          // The dialog renders a secondary buyer email field and the prop
+          // type has always declared this, but it was never passed — so the
+          // field sat blank on every client who has one.
+          secondary_email: fullClient?.secondary_email,
         }}
       />
 
