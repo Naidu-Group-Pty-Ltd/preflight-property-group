@@ -44,6 +44,18 @@ const root = resolve(process.cwd());
  */
 const CASES = [
   {
+    // The fabricated-data gate must notice a deleted generator coming back.
+    // This mutation re-points the ABS service's honest refusal at the ghost
+    // `getMockABSData(` — the invented-demographics generator removed on
+    // 2026-09-06 — which trips the ghost-name check whatever else survives.
+    gate: 'check-fabricated-data.mjs',
+    file: 'supabase/functions/abs-data-service/index.ts',
+    what: 'the ABS demographics fabricator returns',
+    find: 'sourceUnavailable(',
+    replace: 'getMockABSData(',
+    all: true,
+  },
+  {
     gate: 'check-agent-tool-policies.mjs',
     file: 'supabase/functions/ai-dashboard-agent/index.ts',
     what: 'agent trace log stops checking for the superadmin role',
@@ -104,8 +116,28 @@ const CASES = [
     gate: 'check-storage-upload-hardening.mjs',
     file: 'supabase/functions/secure-storage/index.ts',
     what: 'a human upload path is caller-chosen rather than server-generated',
-    find: 'uploadPath = `${uploadBinding.clientId || uploadBinding.ownerUserId || actorId}/${crypto.randomUUID()}',
+    find: 'uploadPath = `${uploadBinding.clientId || uploadBinding.objectClientId || uploadBinding.ownerUserId || actorId}/${crypto.randomUUID()}',
     replace: 'uploadPath = `${path}',
+  },
+  {
+    gate: 'check-migration-version-collisions.mjs',
+    file: 'supabase/migrations/MIGRATION_VERSION_COLLISIONS.json',
+    what: 'a real migration-version collision is dropped from the frozen inventory',
+    // The baseline is what makes the gate quiet about 42 historical collisions;
+    // if losing an entry did not turn it red, the inventory would be a place to
+    // hide a new one.
+    find: '"version": "20261112000000"',
+    replace: '"version": "20261112999999"',
+  },
+  {
+    gate: 'check-edge-column-names.mjs',
+    file: 'supabase/functions/market-updates-embed-backfill/index.ts',
+    what: 'an Edge Function selects a column its table does not have',
+    // The real defect, restored: `market_updates` has `ai_summary` and no
+    // `summary`, so every batch errored and this backfill had never embedded a
+    // single update.
+    find: ".select('id, title, ai_summary, why_it_matters')",
+    replace: ".select('id, title, summary, why_it_matters')",
   },
   {
     gate: 'check-market-digest-authz.mjs',
@@ -338,6 +370,19 @@ const CASES = [
     what: 'a 500 goes back to handing the caller the caught exception',
     find: "JSON.stringify(internalError(error, 'send-email-reply'))",
     replace: "JSON.stringify({ error: error instanceof Error ? error.message : 'Unknown error' })",
+  },
+
+  {
+    gate: 'check-error-disclosure.mjs',
+    file: 'supabase/functions/_shared/aml/standaloneVerification.ts',
+    what: 'the console carve-out widens from a literal message to any expression',
+    /* The carve-out admits `console.warn('literal', JSON.stringify({ … }))`
+       because that is a log line and the log is where the detail belongs. It
+       must admit ONLY a literal: an expression in that position could carry
+       the very leak this gate exists to catch, and the object beside it is
+       still built inside a catch block. */
+    find: "console.warn('[aml-verification] token reserve unavailable', JSON.stringify({",
+    replace: 'console.warn(logPrefix(err), JSON.stringify({',
   },
 
   // ── The Cloudflare worker's own gate ─────────────────────────────────────
