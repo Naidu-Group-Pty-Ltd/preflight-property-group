@@ -35,6 +35,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { ANNOTATED_VERDICT, CLEAN_VERDICT } from './fixtures/builderStockPictures';
+import { recoverCompressedObjects } from '../../../supabase/functions/_shared/builderStock/pdfSourcePhoto';
 
 import {
   assignPdfMediaRoles, findPropertyCoverPages, packageFactsOn, selectCoverHero,
@@ -55,7 +56,9 @@ import {
   indexPdfObjects, objectStreamSlices, pageOrderIsAuthoritative, parseObjectStream,
   qualifyingPhotographsFrom, readPdfPage,
 } from '../../../supabase/functions/_shared/builderStock/pdfPageImages.pure';
-import { selectPdfPropertyPrimary } from '../../../supabase/functions/_shared/builderStock/pdfSourcePhoto';
+import {
+  discoverPdfSourceAssets, selectPdfPropertyPrimary,
+} from '../../../supabase/functions/_shared/builderStock/pdfSourcePhoto';
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -309,10 +312,31 @@ describe('F — the Lot 537 regression, in the shape the live contract has', () 
     expect(selection.primary!.page).toBe(1);
     expect(selection.primary!.provenance.page).toBe(1);
 
-    const interior = selection.assets.find((asset) => asset.provenance.objectNumber === 28);
-    expect(interior).toBeDefined();
-    expect(interior!.role.role).toBe('unknown');
-    expect(interior!.page).toBe(2);
+    /*
+     * AND THE INTERIOR ON PAGE 2 IS NEVER DECODED AT ALL.
+     *
+     * `selectPdfPropertyPrimary` now scopes materialisation to the pages the
+     * TEXT says could be this property's cover — see `coverSearchPages`. Page
+     * 2 is not one of them, so its raster is not decoded, not transcoded and
+     * not returned. That is the point rather than a side effect: decoding
+     * every page of a 13.2 MB brochure before deciding anything is what was
+     * killing the worker on the two heaviest packages in the live stock list.
+     *
+     * The guarantee this replaces is strictly stronger. The interior used to
+     * be present and refused; now it cannot be reached to be refused.
+     */
+    expect(selection.assets.some((asset) => asset.page === 2)).toBe(false);
+    expect(selection.assets.map((asset) => asset.provenance.objectNumber)).toEqual([1136]);
+  });
+
+  it('still finds every picture when nothing has said which page could be the cover', async () => {
+    // The scoping is an OPINION, and an absent opinion changes nothing:
+    // unscoped discovery is what `extract.ts` uses to read a whole stock list
+    // out of one PDF, and it still sees both pages.
+    const bytes = await buildLiveShapedPdf();
+    const found = await discoverPdfSourceAssets(bytes);
+    expect(found.assets.map((asset) => asset.provenance.objectNumber).sort((a, b) => a - b))
+      .toEqual([28, 1136]);
   });
 
   it('attributes a one-property document to its COVER page, not to its first photograph', () => {
@@ -1061,5 +1085,101 @@ describe('W — choosing between two proven primaries for one property', () => {
     });
     expect(chooseDisplayableImage([notPrimary])).toBeNull();
     expect(chooseDisplayableImage([notPrimary, cleanCover])!.id).toBe('cover-clean');
+  });
+});
+
+/**
+ * THE LAST GENERATION OF A COMPRESSED OBJECT IS THE LIVE ONE.
+ *
+ * An incrementally updated PDF appends each revision after the one it
+ * replaces, so when two object streams both carry object N, the later text is
+ * what the document's xref would serve and the earlier is history. The merge
+ * used to keep the FIRST — measured live, 2 September 2026, on the Watsons
+ * Reach lot 102 brochure (five generations, twenty-one object streams): the
+ * stale generation of the page dictionary mapped its images to the template's
+ * sample artwork — another design's floor plan, labelled LOT 414 — while the
+ * newest generation, never read, mapped the builder's real 1920x1080 facade
+ * render. The raw byte scan already lets the last occurrence win; the
+ * recovered path has to agree, or which generation a page gets depends on
+ * where the writer happened to put it.
+ */
+describe('the last generation of a compressed object wins', () => {
+  const twoGenerations = [
+    '%PDF-1.5',
+    '1 0 obj',
+    '<</Type /ObjStm /N 1 /First 4 /Length 24>>',
+    'stream',
+    '5 0 <</Generation /Old>>',
+    'endstream',
+    'endobj',
+    '2 0 obj',
+    '<</Type /ObjStm /N 1 /First 4 /Length 24>>',
+    'stream',
+    '5 0 <</Generation /New>>',
+    'endstream',
+    'endobj',
+  ].join('\n');
+
+  it('recovers the newest object-stream copy, not the first written', async () => {
+    const recovered = await recoverCompressedObjects(new TextEncoder().encode(twoGenerations));
+    expect(recovered.get(5)).toContain('/New');
+    expect(recovered.get(5)).not.toContain('/Old');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// X — a modest facade on a busy details page (Thornhill Gardens, measured)
+// ---------------------------------------------------------------------------
+
+/**
+ * WHAT THIS PINS, MEASURED ON THE LIVE DROPBOX BROCHURE, 6 SEPTEMBER 2026.
+ *
+ * "Thornhill-Gardens-Lot-313-Daylilly-Way-LX-18E-Mercer" designates its
+ * details page as the cover (identity + the package facts), and that page
+ * draws seven rasters: the property's facade from a 480x339 JPEG at 17% of
+ * the page, a 3423x1588 logo lockup at 2.8%, four icons under 50px, and the
+ * floor plan. The 600x400 pixel floor refused the facade — the ONLY
+ * photograph of the property in the document — and the row was told "none of
+ * them presents a photograph of this property".
+ *
+ * Every number below is the measurement, not an approximation: dims, stream
+ * detail, drawn share, on an A4 page.
+ */
+describe('X — a 480x339 facade at 17% of the cover qualifies and is elected', () => {
+  const A4 = { width: 595.276, height: 841.89 };
+  const drawnAt = (w: number, h: number, index = 0) => ({
+    name: 'Im', drawn: { x: 0, y: 0, width: w, height: h },
+    clip: null, index, ctm: [1, 0, 0, 1, 0, 0] as [number, number, number, number, number, number],
+  });
+  const jpeg = (name: string, objectNumber: number, width: number, height: number, bytes: number) => ({
+    name, objectNumber, width, height, start: 0, end: bytes,
+    filters: ['DCTDecode'], components: 3, bitsPerComponent: 8,
+  });
+
+  const facade = { image: jpeg('Im1', 34, 480, 339, 33_477), placement: drawnAt(348, 246) };
+  const logo = { image: jpeg('Im2', 35, 3423, 1588, 170_524), placement: drawnAt(173, 80) };
+  const icon = { image: jpeg('Im3', 69, 47, 33, 2_000), placement: drawnAt(17, 12) };
+  const plan = { image: jpeg('Im7', 76, 466, 867, 82_135), placement: drawnAt(183, 341) };
+
+  it('the facade and the plan qualify; the logo and the icons never reach the election', () => {
+    const candidates = qualifyingPhotographsFrom(
+      [facade, logo, icon, plan], A4.width, A4.height,
+    );
+    const keys = candidates.map((c) => `${c.image.objectNumber}`).sort();
+    expect(keys).toEqual(['34', '76']);
+  });
+
+  it('the election takes the photograph over the plan, by their pixels', () => {
+    const outcome = selectCoverHero([
+      { key: 'facade', placementsOnPage: 1, pagesDrawnOn: 1, pageAreaShare: 0.171, visualKind: 'photo' },
+      { key: 'plan', placementsOnPage: 1, pagesDrawnOn: 1, pageAreaShare: 0.125, visualKind: 'floorplan' },
+    ]);
+    expect(outcome.kind).toBe('hero');
+    expect(outcome.kind === 'hero' && outcome.key).toBe('facade');
+  });
+
+  it('an icon-sized raster still refuses whatever floor moves', () => {
+    const candidates = qualifyingPhotographsFrom([icon], A4.width, A4.height);
+    expect(candidates).toHaveLength(0);
   });
 });

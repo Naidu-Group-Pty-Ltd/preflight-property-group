@@ -30,8 +30,15 @@ import {
 import {
   nextImageStage,
 } from '../../../supabase/functions/_shared/builderStock/imagePriority.pure';
-
-const PROVENANCE_VERSION = 5;
+/*
+ * THE REAL CONSTANT, NOT A COPY OF IT. This was `const PROVENANCE_VERSION = 5`
+ * — a literal restating a value that exists to be raised, so every bump broke
+ * two tests that had no opinion about the version at all. A literal at each end
+ * is how two ends drift.
+ */
+import {
+  PROVENANCE_VERSION,
+} from '../../../supabase/functions/_shared/builderStock/sourceImages';
 
 describe('A — the package link is readable without the live source', () => {
   it('a stored source_row carries the package link and the anchor', () => {
@@ -77,7 +84,7 @@ describe('B,C,D — a package answered once is never bought twice', () => {
   const noImageDetail = 'package named no deterministic image';
 
   it('C — a package that named no image is remembered, so the next tick moves on', () => {
-    const answered = recordNoDeterministicImage(question('pkg-a', 'row-a'), noImageDetail);
+    const answered = recordNoDeterministicImage(question('pkg-a', 'row-a'), noImageDetail, 'inspected');
     // Asked again at the same version, about the same package and row: settled.
     expect(negativeProvenanceStillStands(answered, question('pkg-a', 'row-a'))).toBe(true);
     // A DIFFERENT property is not answered by it, so the sweep advances.
@@ -85,7 +92,7 @@ describe('B,C,D — a package answered once is never bought twice', () => {
   });
 
   it('a changed package or a version bump re-opens the question', () => {
-    const answered = recordNoDeterministicImage(question('pkg-a', 'row-a'), noImageDetail);
+    const answered = recordNoDeterministicImage(question('pkg-a', 'row-a'), noImageDetail, 'inspected');
     expect(negativeProvenanceStillStands(answered, question('pkg-new', 'row-a'))).toBe(false);
     expect(negativeProvenanceStillStands(answered, {
       ...question('pkg-a', 'row-a'), provenanceVersion: PROVENANCE_VERSION + 1,
@@ -106,7 +113,7 @@ describe('B,C,D — a package answered once is never bought twice', () => {
         !negativeProvenanceStillStands(answers.get(row.anchor), question(row.pkg, row.anchor)));
       if (!next) break;
       bought.push(next.anchor);                       // one recovery this tick
-      answers.set(next.anchor, recordNoDeterministicImage(question(next.pkg, next.anchor), noImageDetail));
+      answers.set(next.anchor, recordNoDeterministicImage(question(next.pkg, next.anchor), noImageDetail, 'inspected'));
     }
 
     expect(answers.size).toBe(14);
@@ -249,6 +256,11 @@ function liveDb(seed: { uploads: FakeRow[]; items: FakeRow[] }) {
       in(c: string, v: unknown) { filters.push(['in', c, v]); return builder; },
       limit() { return builder; },
       order() { return builder; },
+      // A paged read asks for one page at a time, because the API caps every
+      // response at `db-max-rows` however large a `.limit()` it is given.
+      range(from: number, to: number) {
+        return Promise.resolve(builder as any).then((page: any) => ({ data: (page?.data ?? []).slice(from, to + 1), error: page?.error ?? null }));
+      },
       maybeSingle() {
         const rows = (tables[table] ?? []).filter((row) => matches(row, filters));
         return Promise.resolve({ data: rows[0] ?? null, error: null });
