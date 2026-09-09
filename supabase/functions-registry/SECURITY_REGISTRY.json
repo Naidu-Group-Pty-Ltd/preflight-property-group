@@ -15,6 +15,27 @@
       "reviewed": true,
       "wp14_auto_classified": true
     },
+    "abs-poa-ingest": {
+      "verify_jwt": true,
+      "exposure_class": "internal-service",
+      "owner": "reporting-engine-program",
+      "reviewed": true,
+      "notes": "ABS reference-data ingest. Gateway JWT on; inside, internal edge secret or the self-sealing empty-table bootstrap arm (see function header). Reads public ABS files; writes only the abs_* reference tables."
+    },
+    "abs-regional-ingest": {
+      "verify_jwt": true,
+      "exposure_class": "internal-service",
+      "owner": "reporting-engine-program",
+      "reviewed": true,
+      "notes": "ABS Regional population (ERP by SA2) ingest \u2014 fetches the release datacube from abs.gov.au itself (measured reachable from this project); parsing server-side with refusal-shaped bounds incl. the national-total plausibility anchor. Gateway JWT on; inside, internal edge secret (bearer or X-Cron-Secret) or the self-sealing empty-table bootstrap. Writes only abs_sa2_meta/abs_sa2_population/abs_regional_sync."
+    },
+    "abs-regional-service": {
+      "verify_jwt": false,
+      "exposure_class": "public",
+      "owner": "reporting-engine-program",
+      "reviewed": true,
+      "notes": "Regional trends reading: resolves the coordinate to its SA2 (ABS ASGS2021 geoserver, cached per ~110 m cell) and serves the loaded ERP series and growth. parseJsonBody-bounded like the other public locality services; refuses honestly without a coordinate."
+    },
     "abs-seifa-service": {
       "verify_jwt": false,
       "exposure_class": "human-authenticated",
@@ -503,6 +524,13 @@
       "reviewed": true,
       "notes": "Cron sweep that brings already-imported builder stock up to the current image rules. Signed internal callers only (verifyInternal) with enforceRawBodyLimit ahead of it; holds a service-role client and crosses organisations, so it must not be reachable by a portal session. Writes builder_stock_item_images, the primary_image_id those rows earn, and the settlement marker; creates and deletes no stock item and touches no price, availability, status, selection or project linkage. Resumable and bounded per tick, and the migration's cron job unschedules itself once no upload is below the current version."
     },
+    "builder-stock-link-callback": {
+      "verify_jwt": false,
+      "exposure_class": "webhook-secret",
+      "owner": "builder-stock",
+      "reviewed": true,
+      "notes": "Google Sheets hyperlink recovery callback. Authenticated by a per-request one-time capability token presented as `Authorization: Bearer`: each request mints 256 bits of randomness, sends it to Make and stores only its SHA-256, so there is no long-lived shared secret in two systems and a token seen in a third party's log authorises one answer to one question already asked. The token is compared by constant-time hash equality, the request is single-use via an atomic claim, expires in 30 minutes, and is bound to the exact spreadsheet and tab. Body is capped and the organisation is rate limited. Carries no Supabase identity because the caller is an external automation. Organisation, upload and property authority are read from the stored request row and are never accepted from the payload."
+    },
     "builder-stock-marketplace": {
       "verify_jwt": false,
       "exposure_class": "module-gated",
@@ -708,6 +736,13 @@
       "owner": "client-fact-find-program",
       "reviewed": true,
       "reviewed_in": "advanced-client-fact-find-phases-1-2"
+    },
+    "crime-data-ingest": {
+      "verify_jwt": true,
+      "exposure_class": "internal-service",
+      "owner": "reporting-engine-program",
+      "reviewed": true,
+      "notes": "Recorded-crime reference ingest (BOCSAR NSW postcode zip, QPS QLD LGA csv). Gateway JWT on; inside, internal edge secret or the per-state self-sealing empty-table bootstrap. Reads public files; writes only crime_reference/crime_sync/crime_state_benchmarks."
     },
     "crime-statistics-service": {
       "verify_jwt": false,
@@ -1942,6 +1977,12 @@
       "reviewed": true,
       "wp14_auto_classified": true
     },
+    "market-source-probe": {
+      "verify_jwt": true,
+      "exposure_class": "human-authenticated",
+      "owner": "reporting-engine-program",
+      "reviewed": true
+    },
     "market-source-relay": {
       "verify_jwt": false,
       "exposure_class": "internal-service",
@@ -2093,6 +2134,12 @@
       "wp14_auto_classified": true
     },
     "mission-control-feedback-prompt": {
+      "verify_jwt": false,
+      "exposure_class": "human-authenticated",
+      "owner": "security-remediation-program",
+      "reviewed": true
+    },
+    "mission-control-gate": {
       "verify_jwt": false,
       "exposure_class": "human-authenticated",
       "owner": "security-remediation-program",
@@ -2322,6 +2369,13 @@
       "reviewed": true,
       "wp14_auto_classified": true
     },
+    "planning-data-service": {
+      "verify_jwt": false,
+      "exposure_class": "internal-service",
+      "owner": "reporting-engine-program",
+      "reviewed": true,
+      "notes": "Planning/zoning/DA readings from state government spatial services at a property coordinate. verifyAuth inside (internal edge secret); assessAuPoint gates the coordinate; outbound calls go only to the fixed government endpoints in planningSources.pure.ts (no caller-supplied URL). Writes only planning_data_cache."
+    },
     "portal-book-appointment": {
       "verify_jwt": false,
       "exposure_class": "portal-authenticated",
@@ -2384,6 +2438,13 @@
       "owner": "security-remediation-program",
       "reviewed": true,
       "wp14_auto_classified": true
+    },
+    "rba-tables-ingest": {
+      "verify_jwt": true,
+      "exposure_class": "internal-service",
+      "owner": "reporting-engine-program",
+      "reviewed": true,
+      "notes": "RBA statistical-tables ingest (F1.1/G1/F5). The CSV text arrives IN the POST body because rba.gov.au 403s this project's egress; all parsing server-side with refusal-shaped bounds. Gateway JWT on; inside, internal edge secret (bearer or X-Cron-Secret) or the per-table self-sealing empty-table bootstrap. Writes only rba_series_meta/rba_observations/rba_sync."
     },
     "reclassify-property": {
       "verify_jwt": false,
@@ -2518,6 +2579,13 @@
       "reviewed": true,
       "wp14_auto_classified": true
     },
+    "report-sections-index": {
+      "verify_jwt": true,
+      "exposure_class": "internal-service",
+      "owner": "reporting-engine-program",
+      "reviewed": true,
+      "notes": "Per-section index over stored investment reports (Phase 3). Derives an addressable projection of investment_reports.report_content with _shared/reports/investment/sectionStorage.pure.ts and writes ONLY investment_report_sections / investment_report_section_index \u2014 never a client report. Gateway JWT on; inside, the internal edge secret (bearer or X-Cron-Secret) or the per-REPORT self-sealing arm (a report with no index row may be indexed once without it; force always needs the secret). An index is written only where re-assembly proves it lossless, and the stored counts describe what is stored."
+    },
     "request-lead-magnet": {
       "verify_jwt": false,
       "exposure_class": "public",
@@ -2529,6 +2597,12 @@
       "verify_jwt": false,
       "exposure_class": "module-gated",
       "owner": "security-remediation-program",
+      "reviewed": true
+    },
+    "resolve-report-geography": {
+      "verify_jwt": true,
+      "exposure_class": "cron-worker",
+      "owner": "reporting-engine-audit",
       "reviewed": true
     },
     "resume-bulk-generation": {
@@ -2830,6 +2904,13 @@
       "owner": "security-remediation-program",
       "reviewed": true,
       "wp14_auto_classified": true
+    },
+    "transport-gtfs-ingest": {
+      "verify_jwt": true,
+      "exposure_class": "internal-service",
+      "owner": "reporting-engine-program",
+      "reviewed": true,
+      "notes": "Public transport GTFS ingest (TfNSW, TransLink SEQ, NT DIPL Darwin and Alice Springs). Reads one member out of each publisher's own archive by HTTP range rather than downloading it -- NSW's is 292 MB and only stops.txt is fetched. Gateway JWT on; inside, internal edge secret or the per-feed self-sealing bootstrap, which seals on a load that SUCCEEDED so a killed load can still resume. Reads public files; writes only transport_stops/transport_feed_syncs. The probe and digest stages read and write nothing."
     },
     "update-ghl-opportunity-stage": {
       "verify_jwt": true,

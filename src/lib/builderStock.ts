@@ -10,6 +10,7 @@
  * where one already exists, so the browser cannot offer a value the server
  * would reject.
  */
+import { addressWithoutLeadingDesignation } from '../../supabase/functions/_shared/builderStock/normalise.pure';
 import {
   comparePrimaryEvidence, isPrimaryRole, readStoredEvidenceLevel, readStoredRole,
 } from '../../supabase/functions/_shared/builderStock/sourceImageRole.pure';
@@ -72,6 +73,12 @@ export interface BuilderStockUpload {
   error_code: string | null;
   /** Safe to display. The internal diagnosis is never sent to the browser. */
   error_message: string | null;
+  /**
+   * Answered by the server from the reason it recorded (which never reaches
+   * the browser): brochure links are waiting to be recovered, and
+   * `refresh_brochure_links` would accept this row.
+   */
+  link_recovery_available?: boolean;
   processing_started_at: string | null;
   processing_completed_at: string | null;
   created_at: string;
@@ -137,8 +144,44 @@ export interface BuilderStockItem {
   created_at: string;
   updated_at: string;
   last_seen_at: string;
+  /**
+   * Where the imagery engine has got to on this property — the ladder's rung,
+   * `settled` being the last. It reaches the browser so a row can tell a
+   * picture that is still coming from one that is not: those read identically
+   * without it, and a person looking at work in flight can only conclude the
+   * product is broken. Optional because a deployment whose server predates
+   * this sends no such field, and `stockImageProgress` treats its absence as
+   * finished rather than inventing progress. */
+  image_work_stage?: string | null;
   /** Attached by the server. */
   images?: BuilderStockImage[];
+  /**
+   * How many builder documents this property's own row attaches — a brochure,
+   * a siting plan, a plan of subdivision.
+   *
+   * Counted by the server with the same rule the image pipeline uses to decide
+   * what it will try, so this cannot claim a document the pipeline would not
+   * read. It is a COUNT and never a list: saying a row attaches nothing needs
+   * no address.
+   *
+   * Zero is the one reason for a missing picture that a builder can act on. No
+   * reader conjures a document nobody attached.
+   */
+  source_documents?: number;
+  /**
+   * How many of those documents we could not read, split by whose failure it
+   * was: `unprocessed` is ours, `unreachable` is the link's. Never a finding
+   * about the document itself.
+   *
+   * A count and nothing else. Why a document could not be read is the
+   * pipeline's own vocabulary — a kill, a memory ceiling, a timeout, a retry
+   * tally — and none of it belongs on a builder's screen; what belongs there
+   * is that the document has not been read yet. Kept apart from
+   * `source_documents` because "we never read it" and "we read it and it
+   * showed no house" call for opposite actions.
+   */
+  source_documents_unprocessed?: number;
+  source_documents_unreachable?: number;
   builder_organisation?: { id: string; legal_name: string; trading_name: string | null } | null;
   selection_count?: number;
   latest_selection?: {
@@ -269,11 +312,21 @@ export const STOCK_SELECTION_STATUS_LABELS: Record<StockSelectionStatus, string>
 export function stockItemTitle(item: Pick<BuilderStockItem,
   'unit_number' | 'lot_number' | 'address_line' | 'development_name'
   | 'project_name' | 'external_reference'>): string {
-  const prefix = item.unit_number
-    ? `Unit ${item.unit_number}`
-    : item.lot_number ? `Lot ${item.lot_number}` : '';
-  const body = item.address_line
-    ?? item.development_name ?? item.project_name ?? item.external_reference ?? '';
+  const designation: { word: 'Lot' | 'Unit'; value: string } | null = item.unit_number
+    ? { word: 'Unit', value: String(item.unit_number) }
+    : item.lot_number ? { word: 'Lot', value: String(item.lot_number) } : null;
+  const prefix = designation ? `${designation.word} ${designation.value}` : '';
+  /*
+   * The address without the designation the prefix is about to repeat — the
+   * SAME rule the server's own label applies, imported rather than restated,
+   * because a card reading "Lot 1731, Lot 1731 Hornsea Street" and a log
+   * reading "Lot 1731, Hornsea Street" are two answers to one question.
+   */
+  const address = designation
+    ? addressWithoutLeadingDesignation(item.address_line, designation.word, designation.value)
+    : (item.address_line ?? '');
+  const body = address
+    || item.development_name || item.project_name || item.external_reference || '';
   if (prefix && body) return `${prefix}, ${body}`;
   return prefix || body || 'Unnamed property';
 }

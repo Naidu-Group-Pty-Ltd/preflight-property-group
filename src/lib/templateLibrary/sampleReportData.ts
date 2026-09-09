@@ -41,6 +41,7 @@ import { projectMarketIntelligence } from '../../../supabase/functions/_shared/m
 import { projectReportQa } from '../../../supabase/functions/_shared/reportQaProjection.pure';
 import { buildReportQaDocument } from '../../../supabase/functions/_shared/reports/reportQa/normalise.pure';
 import { buildMarketIntelligenceReport } from '../../../supabase/functions/_shared/reports/marketIntelligence/normalise.pure';
+import { taxEffectOf } from '@/lib/cashFlow/projectionEngine.pure';
 
 const ADDRESS = '14 Marlborough Street, Leichhardt NSW 2040';
 const CLIENT = 'Jordan & Sarah Nguyen';
@@ -1144,6 +1145,12 @@ export const SAMPLE_REPORT_DATA: Record<string, unknown> = {
    */
   report: {
     generatedDate: '2 August 2026',
+    // The document identity the Investment masters bind. The sample previews
+    // the compass tier — the catalogue's own document — and the projection's
+    // `DOCUMENT_IDENTITY` translates the other tiers at render time.
+    tier: 'compass',
+    documentTitle: 'Investment Compass',
+    standfirst: 'What the property is, what it costs to hold, and what the assessment concluded.',
     // The lender profile a Borrowing Capacity run was assessed under. Set on
     // 26 of 143 assessments, so the masters keep the block conditional; the
     // sample shows the named-lender path and matches `loan.lender` below.
@@ -2533,13 +2540,17 @@ export const SAMPLE_REPORT_DATA: Record<string, unknown> = {
       const preTax = rent - expenses - interest - principal;
       const deductions = expenses + interest;
       const netProfit = rent - deductions;
-      const refund = netProfit < 0 ? -netProfit * (taxRate / 100) : 0;
-      const afterTax = preTax + refund;
+      // The SIGNED tax effect, through the one rule the production engine
+      // uses. This sample carried the third copy of "a loss refunds, a profit
+      // is free", so a template previewed against it showed the same
+      // impossible picture a client's report did.
+      const { taxEffect } = taxEffectOf(netProfit, taxRate / 100);
+      const afterTax = preTax + taxEffect;
       return {
         y, value, balance, equity: value - balance, lvr: (balance / value) * 100,
         rent, grossYield: (rent / value) * 100,
         netYield: ((rent - expenses) / value) * 100,
-        expenses, interest, principal, preTax, deductions, netProfit, refund, afterTax,
+        expenses, interest, principal, preTax, deductions, netProfit, taxEffect, afterTax,
       };
     });
 
@@ -2587,7 +2598,7 @@ export const SAMPLE_REPORT_DATA: Record<string, unknown> = {
         depreciation: row(() => '—'),
         totalDeductions: row((r) => money(r.deductions)),
         netProfitLoss: row((r) => signed(r.netProfit)),
-        taxRefund: row((r) => money(r.refund)),
+        taxRefund: row((r) => money(r.taxEffect)),
         afterTaxPA: row((r) => signed(r.afterTax)),
         afterTaxPW: row((r) => signed(r.afterTax / 52)),
       },

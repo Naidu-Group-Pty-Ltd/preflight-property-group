@@ -9,6 +9,9 @@
  */
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { invokeBuilderFunction } from '@/lib/builderPortal';
+import {
+  countArrivingUploads, countWorkingImages,
+} from '../../supabase/functions/_shared/builderStock/imageProgress.pure';
 import type {
   BuilderStockItem, BuilderStockSelectionForBuilder, BuilderStockUpload,
 } from '@/lib/builderStock';
@@ -49,16 +52,48 @@ async function invoke<T>(body: Record<string, unknown>): Promise<T> {
 // Reads
 // ---------------------------------------------------------------------------
 
+/**
+ * How often the list re-reads itself while the imagery engine still owes it
+ * something. The engine's own scheduler runs each minute, so this is a little
+ * faster than the fastest thing it could report.
+ */
+const STOCK_WORKING_POLL_MS = 20_000;
+
 export function useBuilderStockUploads(page = 1) {
   return useQuery({
     queryKey: builderStockKeys.uploads(page),
     queryFn: () => invoke<Paginated<BuilderStockUpload>>({
       operation: 'list_uploads', page, page_size: 20,
     }),
+    /*
+     * An upload that is still reading its file or finding its images changes
+     * underneath the page, and it is what tells the list whether more
+     * properties are coming. Polled only while one is in flight, and stopped
+     * the moment they have all finished — the same rule as the item list.
+     */
+    refetchInterval: (query) => (
+      countArrivingUploads(query.state.data?.records ?? []) > 0
+        ? STOCK_WORKING_POLL_MS
+        : false
+    ),
   });
 }
 
-export function useBuilderStockItems(filters: StockFilters) {
+export function useBuilderStockItems(
+  filters: StockFilters,
+  /*
+   * A reason to keep polling that this page's OWN rows cannot show.
+   *
+   * A replacement stock list writes its new properties staged, and this list
+   * reads active ones, so properties still arriving are invisible here by
+   * design. Without this the page would promise "more will appear" on a
+   * screen that had stopped asking — the exact failure the banner exists to
+   * end. Deliberately not part of the query key: it changes when to re-read,
+   * never what is read, and keying on it would throw the cache away each time
+   * an upload finished.
+   */
+  options: { pollWhileArriving?: boolean } = {},
+) {
   return useQuery({
     queryKey: builderStockKeys.items(filters),
     queryFn: () => invoke<Paginated<BuilderStockItem>>({
@@ -69,6 +104,32 @@ export function useBuilderStockItems(filters: StockFilters) {
       page: filters.page,
       page_size: filters.pageSize,
     }),
+    /*
+     * POLL ONLY WHILE THERE IS SOMETHING TO SEE.
+     *
+     * A row that says "Finding a picture…" has to be able to stop saying it
+     * without the person reloading the page — telling somebody to wait on a
+     * screen that never changes is worse than telling them nothing. So the
+     * list re-reads itself exactly while at least one property on this page
+     * is still being worked, and stops the moment none is.
+     *
+     * Off by default rather than on: a builder whose stock has all settled is
+     * the ordinary case, and every one of those pages polling for ever would
+     * be this page's cost to every other tenant.
+     */
+    refetchInterval: (query) => {
+      if (options.pollWhileArriving) return STOCK_WORKING_POLL_MS;
+      const records = query.state.data?.records ?? [];
+      return countWorkingImages(records.map((item) => ({
+        hasImage: !!item.primary_image_id,
+        sourceDocuments: item.source_documents ?? 0,
+        unprocessedDocuments: item.source_documents_unprocessed ?? 0,
+        unreachableDocuments: item.source_documents_unreachable ?? 0,
+        workStage: item.image_work_stage,
+      }))) > 0
+        ? STOCK_WORKING_POLL_MS
+        : false;
+    },
   });
 }
 
@@ -408,6 +469,110 @@ export function useRecoverStockSourceImages() {
       }>({
         operation: 'reprocess_source_images',
         ...(uploadId ? { upload_id: uploadId } : {}),
+      }),
+    onSuccess: () => { void queryClient.invalidateQueries({ queryKey: builderStockKeys.root() }); },
+  });
+}
+
+/**
+ * Hand over a picture for ONE property.
+ *
+ * Uploaded exactly as a stock list is — a signed URL, the browser PUTs to it,
+ * and a second call confirms. The bytes are validated SERVER-SIDE out of
+ * storage on that second call, so what is registered is what was actually
+ * stored rather than what this browser said it sent.
+ *
+ * IT NAMES ONE PROPERTY AND REACHES NO OTHER. There was briefly a second
+ * scope — a render supplied against a house DESIGN and fanned out to every
+ * lot stating it — and it is withdrawn: a matching design string is not
+ * evidence that a photograph is of a particular house.
+ *
+ * NOTHING HERE DECIDES WHICH PICTURE A CARD DRAWS. The supplied image is
+ * stored at evidence level 1 and the settler re-decides each card from the
+ * roles, as it always has.
+ */
+export function useSupplyBuilderStockImage() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (input: { file: File; stockItemId: string }) => {
+      const created = await invoke<{ storage_path: string; upload_url: string }>({
+        operation: 'create_builder_image',
+        filename: input.file.name,
+        stock_item_id: input.stockItemId,
+      });
+
+      const put = await fetch(created.upload_url, {
+        method: 'PUT',
+        headers: { 'Content-Type': input.file.type || 'application/octet-stream' },
+        body: input.file,
+      });
+      if (!put.ok) throw new Error('The image could not be uploaded. Please try again.');
+
+      return await invoke<{ scope: 'property'; properties: number }>({
+        operation: 'attach_builder_image',
+        storage_path: created.storage_path,
+        stock_item_id: input.stockItemId,
+      });
+    },
+    onSuccess: () => { void queryClient.invalidateQueries({ queryKey: builderStockKeys.root() }); },
+  });
+}
+
+/**
+ * Read a source this organisation already imported, again, with today's parsers.
+ *
+ * A stock list is read once at upload and never again, so every correction to
+ * the readers reaches only the NEXT builder's file — the rows already
+ * published keep whatever the parser believed on the day. Two such corrections
+ * are why this exists: an uploaded workbook was read for its displayed values
+ * alone, so every brochure link in it was discarded; and a `LAND $` column
+ * normalised to the same key as `LAND M2`, so the land PRICE was published as
+ * the land SIZE.
+ *
+ * IT IS NOT A RE-UPLOAD, and re-uploading is not an alternative: identical
+ * bytes are refused by a unique index, so the only route used to be deleting
+ * the source and adding it again — which discards its history and every client
+ * selection made against its properties. This re-reads the file already in the
+ * bucket and updates each property in place, so ids, selections and the audit
+ * trail all survive.
+ *
+ * It DOES rewrite what the source states — a price, a land size, a design, a
+ * document link — because that is the point. What it cannot do is invent a
+ * property or move one that the source no longer describes; the import's own
+ * identity rule decides that, exactly as it does on any re-import.
+ */
+export function useReprocessStockSource() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (uploadId: string) =>
+      invoke<{
+        upload: BuilderStockUpload;
+        summary: StockImportSummary;
+        enrichment_pending: number;
+      }>({
+        operation: 'reprocess_upload',
+        upload_id: uploadId,
+      }),
+    onSuccess: () => { void queryClient.invalidateQueries({ queryKey: builderStockKeys.root() }); },
+  });
+}
+
+/**
+ * Ask again for the brochure links a Google Sheet would not export.
+ *
+ * The SOURCE only. No rows are re-imported, no stock data is touched, and no
+ * price, availability or client selection moves — this exists precisely so a
+ * builder does not have to delete and re-upload a working stock list to pick
+ * up a document link. The server refuses unless the upload is a Google Sheet
+ * currently reporting that its workbook could not be exported.
+ */
+export function useRefreshBrochureLinks() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (uploadId: string) =>
+      invoke<{ requested: boolean }>({
+        operation: 'refresh_brochure_links',
+        upload_id: uploadId,
       }),
     onSuccess: () => { void queryClient.invalidateQueries({ queryKey: builderStockKeys.root() }); },
   });

@@ -135,13 +135,60 @@ export type ListingsRoute =
     }
   | {
       via: 'broker';
+      /** Mission Control's ORIGIN. Any path the setting carried is trimmed. */
       missionControlUrl: string;
+      /**
+       * What was trimmed, when the setting carried a path.
+       *
+       * Kept so a failure can SAY it rather than a repair happening silently:
+       * a deployment whose `MISSION_CONTROL_URL` is `…/api` was composing
+       * `…/api/api/public/listings/tables`, which Mission Control's own router
+       * answers 404 — indistinguishable, before this, from Airtable's 404.
+       */
+      trimmedPath?: string;
       headers: Record<string, string>;
       secret: string;
       /** Mission Control meters the vendor call it makes. Never both. */
       meter: false;
     }
   | { via: 'unconfigured'; why: string };
+
+/**
+ * Read `MISSION_CONTROL_URL` as an ORIGIN, and say what was trimmed.
+ *
+ * Every path this module composes is rooted — `/api/public/listings/…` — so a
+ * base carrying its own path is unusable by construction: the two are
+ * concatenated and the result is a URL nobody serves. Measured 8 Sep 2026,
+ * `https://mission-control.aurixasystems.com.au/api` composes
+ * `…/api/api/public/listings/tables`, which Mission Control's router answers
+ * **404** with none of its own headers on it — so the clone recorded Airtable's
+ * name against Mission Control's refusal to route, and no request was ever
+ * metered because none reached a handler.
+ *
+ * Trailing slashes were already trimmed here for the same reason; a path is
+ * the same mistake one character further on. It is trimmed rather than refused
+ * because refusing would take a deployment that is one concatenation from
+ * correct entirely off the air — and it is REPORTED rather than trimmed
+ * silently, because a repair nobody is told about is a setting that stays
+ * wrong.
+ */
+export function missionControlOrigin(raw: string): {
+  origin: string;
+  trimmedPath?: string;
+} {
+  const trimmed = raw.trim().replace(/\/+$/, '');
+  if (!trimmed) return { origin: '' };
+  try {
+    const u = new URL(trimmed);
+    const path = u.pathname.replace(/\/+$/, '');
+    return path ? { origin: u.origin, trimmedPath: path } : { origin: u.origin };
+  } catch {
+    // Not parseable as a URL. Hand it back as it was: naming the setting in a
+    // failure is more use than replacing it with an empty string, which reads
+    // as "not configured" and sends an operator to the wrong remedy.
+    return { origin: trimmed };
+  }
+}
 
 export function resolveListingsRoute(input: {
   airtableToken: string | null | undefined;
@@ -175,9 +222,10 @@ export function resolveListingsRoute(input: {
     };
   }
 
-  const mcUrl = (input.missionControlUrl ?? '').trim().replace(/\/+$/, '');
+  const rawMc = (input.missionControlUrl ?? '').trim();
+  const mc = missionControlOrigin(rawMc);
   const cloneKey = (input.cloneApiKey ?? '').trim();
-  if (!mcUrl || !cloneKey) {
+  if (!mc.origin || !cloneKey) {
     return {
       via: 'unconfigured',
       why:
@@ -188,7 +236,8 @@ export function resolveListingsRoute(input: {
 
   return {
     via: 'broker',
-    missionControlUrl: mcUrl,
+    missionControlUrl: mc.origin,
+    ...(mc.trimmedPath ? { trimmedPath: mc.trimmedPath } : {}),
     headers: { 'x-clone-api-key': cloneKey, Accept: 'application/json' },
     secret: cloneKey,
     meter: false,
@@ -321,4 +370,138 @@ export function writebackRequestUrl(route: WritebackRoute, table: string): strin
  */
 export function missionControlRefusal(headers: Headers): string | null {
   return headers.get('x-mission-control-refusal');
+}
+
+/**
+ * Mission Control names itself on every answer its listings endpoint gives —
+ * a refusal AND a relay.
+ *
+ * `x-mission-control-refusal` answers "did Mission Control refuse this, or did
+ * Airtable?". It cannot answer the question one step further out: **did the
+ * request reach Mission Control at all?** It is absent on a relayed vendor
+ * failure and equally absent on a 404 from some other host that
+ * `MISSION_CONTROL_URL` happens to name.
+ *
+ * Measured 8 Sep 2026. One clone recorded `airtable_404` on every Listings
+ * sync for a morning while the two beside it were served normally, and nothing
+ * from it reached Mission Control's ledger at any tick. Its deployed bundle
+ * carried the broker, so it had resolved the brokered route and addressed the
+ * URL it was given — something that is not Mission Control answered, and the
+ * clone wrote it down as the vendor's. Every reading it had was consistent
+ * with a marketplace-wide outage, so that is where it sent anyone who looked.
+ *
+ * This header is a POSITIVE marker of arrival, which is what lets its absence
+ * mean something.
+ */
+export const MISSION_CONTROL_ENDPOINT_HEADER = 'x-mission-control-endpoint';
+
+/** Did Mission Control produce this answer at all — refusal or relay? */
+export function missionControlAnswered(headers: Headers): boolean {
+  return headers.get(MISSION_CONTROL_ENDPOINT_HEADER) !== null;
+}
+
+/** Which end produced a failing answer. */
+export type FailingEnd = 'airtable' | 'mission_control' | 'not_mission_control' | 'unconfigured';
+
+export interface ListingsFailure {
+  /** The end that answered. */
+  readonly end: FailingEnd;
+  /**
+   * A stable code for a log line or a `last_error` column.
+   *
+   * Stable is the point: it is grepped and compared across ticks, so nothing
+   * variable belongs in it. Anything that varies goes in `detail`.
+   */
+  readonly code: string;
+  /** How to name that end to a person reading a message. */
+  readonly service: string;
+  /** Anything variable worth saying beside the code. Never a credential. */
+  readonly detail?: string;
+}
+
+/**
+ * Name the end that produced a failing answer, for a route WE chose.
+ *
+ * Three outcomes rather than the two the refusal header alone can give:
+ *
+ * - **`airtable`** — the direct route (only the vendor can answer), or a
+ *   brokered answer Mission Control marked as its own and did not refuse.
+ * - **`mission_control`** — Mission Control's own no, which is fixed in
+ *   Mission Control's environment rather than on this deployment.
+ * - **`not_mission_control`** — a brokered call whose answer Mission Control
+ *   did not mark. The request went somewhere; that somewhere is not this
+ *   endpoint. `MISSION_CONTROL_URL` is the thing to look at, and no amount of
+ *   investigating Airtable will help.
+ *
+ * The third is the reading that did not exist, and the one a wrong
+ * `MISSION_CONTROL_URL` needs.
+ */
+export function describeListingsFailure(
+  route: ListingsRoute,
+  response: { status: number; headers: Headers },
+): ListingsFailure {
+  if (route.via === 'unconfigured') {
+    // Nothing was called, so nothing answered. Reported rather than thrown:
+    // this runs on a failure path, and throwing here would replace a real
+    // fault with a stack trace about the reporting of it.
+    return { end: 'unconfigured', code: 'airtable_not_configured', service: 'this deployment' };
+  }
+
+  if (route.via === 'direct') {
+    return {
+      end: 'airtable',
+      code: `airtable_${response.status}`,
+      service: 'Airtable',
+      /*
+       * Say the ROUTE, not only the end.
+       *
+       * `resolveListingsRoute` prefers `direct` whenever a token AND a base id
+       * are both present, and it is right to: a deployment holding the
+       * credential should spend its own. But Mission Control withholding a
+       * secret stops it FORWARDING one; it does not remove a value already on
+       * the project. So a clone that everything believes is brokered can still
+       * hold a stale pair, take the direct road, and report the vendor's
+       * status for a base id nobody has looked at since.
+       *
+       * Measured 8 Sep 2026: one clone answered `airtable_404` on every
+       * Listings sync for five hours while appearing zero times in Mission
+       * Control's ledger — every reading it produced was true, and none of
+       * them said which road it had taken.
+       */
+      detail: 'read directly, with AIRTABLE_TOKEN and AIRTABLE_BASE_ID held on this deployment',
+    };
+  }
+
+  const refusal = missionControlRefusal(response.headers);
+  if (refusal) {
+    return {
+      end: 'mission_control',
+      code: `mission_control_${refusal}`,
+      service: 'Mission Control',
+    };
+  }
+
+  if (missionControlAnswered(response.headers)) {
+    return {
+      end: 'airtable',
+      code: `airtable_${response.status}`,
+      service: 'Airtable',
+      // The other road to the same vendor status, named so the two are never
+      // confused: Mission Control made this call and relayed the answer.
+      detail: 'brokered by Mission Control, which relayed this answer',
+    };
+  }
+
+  return {
+    end: 'not_mission_control',
+    code: `mission_control_unreachable_${response.status}`,
+    // Name what was ADDRESSED. "Something that is not Mission Control
+    // answered" narrows the search; the URL ends it — and the host is often
+    // right while the setting carried a path, which reads as the opposite
+    // fault if the message asserts the host is wrong.
+    service: `${route.missionControlUrl} (MISSION_CONTROL_URL)`,
+    detail: route.trimmedPath
+      ? `MISSION_CONTROL_URL carried the path ${route.trimmedPath}, read as its origin`
+      : undefined,
+  };
 }

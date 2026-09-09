@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle, Bath, BedDouble, Boxes, Car, CheckCircle2, ChevronLeft, ChevronRight, FileImage,
   FileSpreadsheet, Globe, Image as ImageIcon, ImageDown, ImageOff, Link2, Loader2, Map, Plus,
-  RefreshCw, Search, Sparkles, Trash2, Upload, UserCheck, type LucideIcon,
+  RefreshCw, Sparkles, Trash2, Upload, UserCheck, type LucideIcon,
 } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -22,17 +22,18 @@ import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from '@/components/ui/select';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
+import { SearchInput } from '@/components/ui/search-input';
 import { useToast } from '@/hooks/use-toast';
 import { cn } from '@/lib/utils';
 import { BuilderPortalShell } from '@/components/builder-portal/BuilderPortalShell';
+import {
+  BuilderPropertyImageButton,
+} from '@/components/builder-portal/BuilderPropertyImage';
 import { BuilderPortalMetricCard } from '@/components/builder-portal/ui/BuilderPortalMetricCard';
 import { useDebounce } from '@/hooks/useDebounce';
 import {
-  importBuilderStockUrl,
-  useAcknowledgeStockSelection, useBuilderStockItems, useBuilderStockSelections,
-  useBuilderStockUploads, useDeleteBuilderStockSource, useEnrichPendingStockImages,
-  useRecoverStockSourceImages, useSetBuilderStockAvailability, uploadBuilderStockFile,
-  type StockImportSummary, type StockUploadProgress, type StockUploadResult,
+  importBuilderStockUrl, type StockImportSummary, type StockUploadProgress, type StockUploadResult, uploadBuilderStockFile, useAcknowledgeStockSelection, useBuilderStockItems, useBuilderStockSelections, useBuilderStockUploads, useDeleteBuilderStockSource, useEnrichPendingStockImages, useRecoverStockSourceImages, useRefreshBrochureLinks, useReprocessStockSource,
+  useSetBuilderStockAvailability,
 } from '@/lib/builderStockQueries';
 import {
   formatFileSize, primaryStockImage, stockFileAcceptAttribute, stockImageStageSummary,
@@ -44,6 +45,10 @@ import {
   type StockImageStage, type StockSelectionStatus, type StockUploadStatus,
 } from '@/lib/builderStock';
 import { isNonBlockingSourceNotice } from '../../../supabase/functions/_shared/builderStock/sourceAccessNotice.pure';
+import {
+  countArrivingUploads, countWorkingImages, stockImageProgress,
+  STOCK_IMAGE_PROGRESS_DETAIL, STOCK_IMAGE_PROGRESS_LABEL,
+} from '../../../supabase/functions/_shared/builderStock/imageProgress.pure';
 
 /**
  * Builder Portal — Stock List.
@@ -125,22 +130,37 @@ export default function BuilderStockList() {
 
   const uploadsQuery = useBuilderStockUploads(1);
   const selectionsQuery = useBuilderStockSelections(1);
+  const arrivingUploads = countArrivingUploads(uploadsQuery.data?.records ?? []);
   const itemsQuery = useBuilderStockItems({
     search: debounced.trim(),
     availability: availability === 'all' ? '' : availability,
     uploadId: uploadFilter === 'all' ? '' : uploadFilter,
     page,
     pageSize: 25,
-  });
+  }, { pollWhileArriving: arrivingUploads > 0 });
 
   const setAvailabilityMutation = useSetBuilderStockAvailability();
   const acknowledge = useAcknowledgeStockSelection();
   const enrichPending = useEnrichPendingStockImages();
   const deleteSource = useDeleteBuilderStockSource();
   const recoverImages = useRecoverStockSourceImages();
+  const refreshLinks = useRefreshBrochureLinks();
+  const reprocessSource = useReprocessStockSource();
 
   const records = itemsQuery.data?.records ?? [];
   const pagination = itemsQuery.data?.pagination;
+  /*
+   * How many properties on this page the imagery engine still owes something.
+   * The list re-reads itself while this is above zero (see
+   * `useBuilderStockItems`), so the number comes down on its own.
+   */
+  const workingImages = countWorkingImages(records.map((item) => ({
+    hasImage: !!item.primary_image_id,
+    sourceDocuments: item.source_documents ?? 0,
+    unprocessedDocuments: item.source_documents_unprocessed ?? 0,
+    unreachableDocuments: item.source_documents_unreachable ?? 0,
+    workStage: item.image_work_stage,
+  })));
   const uploads = uploadsQuery.data?.records ?? [];
   const selections = selectionsQuery.data?.records ?? [];
 
@@ -212,6 +232,79 @@ export default function BuilderStockList() {
    * availability and every client selection stay exactly where they are, and
    * only the pictures change.
    */
+  /**
+   * Only a Google Sheet whose workbook would not export has links to recover.
+   *
+   * The server answers that question per row (`link_recovery_available`),
+   * beside the recorded reason only it may read — this page once derived it
+   * from `error_detail` (which the list never sends) and then from
+   * `error_code` (which carries the notice, not the reason), and under both
+   * readings the control never rendered for anyone. The server is still the
+   * authority: `refresh_brochure_links` re-checks its own row before acting.
+   */
+  const canRefreshBrochureLinks = useCallback((upload: BuilderStockUpload) => (
+    upload.link_recovery_available === true
+  ), []);
+
+  const refreshBrochureLinks = useCallback((upload: BuilderStockUpload) => {
+    refreshLinks.mutate(upload.id, {
+      onSuccess: () => {
+        toast({
+          title: 'Looking for the brochure links',
+          description: 'Your stock list is unchanged. Any documents we recover will '
+            + 'be attached to their properties shortly.',
+        });
+      },
+      onError: (error) => {
+        toast({
+          title: 'Brochure links could not be refreshed',
+          description: error instanceof Error ? error.message : 'Please try again shortly.',
+          variant: 'destructive',
+        });
+      },
+    });
+  }, [refreshLinks, toast]);
+
+  /**
+   * Read this source again with today's parsers.
+   *
+   * Offered on a source that has already been read — a source still waiting
+   * for its first pass has `process_upload`, which reports its own progress
+   * and its own duplicate refusal, and the server refuses this one for it.
+   *
+   * The confirmation says what actually changes, because this is the one
+   * control here that DOES rewrite property data: prices, sizes, designs and
+   * document links are re-read from the file. What it cannot do is lose a
+   * property or a selection — the import matches by the same identity rule it
+   * always has and updates in place.
+   */
+  const canReprocess = useCallback((upload: BuilderStockUpload) => (
+    !['uploaded', 'failed', 'parsing'].includes(String(upload.status ?? ''))
+  ), []);
+
+  const reprocessStockSource = useCallback((upload: BuilderStockUpload) => {
+    reprocessSource.mutate(upload.id, {
+      onSuccess: (response) => {
+        const summary = response.summary;
+        toast({
+          title: 'Source read again',
+          description: summary
+            ? `${summary.imported ?? 0} added, ${summary.updated ?? 0} updated. `
+              + 'Any pictures we can now reach will appear shortly.'
+            : 'Any pictures we can now reach will appear shortly.',
+        });
+        void uploadsQuery.refetch();
+      },
+      onError: (error) => {
+        toast({
+          title: 'That source could not be read again',
+          description: error instanceof Error ? error.message : 'Please try again shortly.',
+          variant: 'destructive',
+        });
+      },
+    });
+  }, [reprocessSource, toast, uploadsQuery]);
+
   const recoverSourceImages = useCallback((upload: BuilderStockUpload) => {
     recoverImages.mutate(upload.id, {
       onSuccess: (response) => {
@@ -418,19 +511,14 @@ export default function BuilderStockList() {
             line instead of forcing the card wider than the column.
           */}
           <div className="flex flex-wrap items-center gap-2">
-            <div className="relative min-w-0 flex-1 basis-64">
-              <Search
-                className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground"
-                aria-hidden
-              />
-              <Input
-                value={search}
-                onChange={(event) => setSearch(event.target.value)}
-                placeholder="Search address, suburb, development or reference"
-                className="h-9 w-full pl-9"
-                aria-label="Search stock"
-              />
-            </div>
+            <SearchInput
+              value={search}
+              onValueChange={setSearch}
+              placeholder="Search address, suburb, development or reference"
+              aria-label="Search stock"
+              containerClassName="min-w-0 flex-1 basis-64"
+              className="h-9 w-full"
+            />
             <Select value={availability} onValueChange={setAvailability}>
               <SelectTrigger
                 className="h-9 w-full min-w-0 sm:w-44"
@@ -488,6 +576,49 @@ export default function BuilderStockList() {
             </div>
           ) : (
             <>
+              {/*
+                WORK IN FLIGHT, SAID ONCE AT THE TOP.
+
+                Reading it off the rows rather than asking the server for a
+                second opinion, so the banner and the badges can never
+                disagree. It disappears by itself: the list re-reads while this
+                is above zero and the count comes down as the engine settles
+                each property, so nobody is told to wait on a screen that never
+                changes — and nobody has to reload to find out it is done.
+              */}
+              {workingImages > 0 || arrivingUploads > 0 ? (
+                <div
+                  role="status"
+                  className="mb-4 flex items-start gap-2.5 rounded-lg border border-border/70 bg-muted/40 px-3 py-2.5"
+                >
+                  <Loader2
+                    className="mt-0.5 h-4 w-4 shrink-0 animate-spin text-muted-foreground motion-reduce:animate-none"
+                    aria-hidden
+                  />
+                  <div className="min-w-0 text-sm">
+                    <p className="font-medium">
+                      {workingImages > 0
+                        ? workingImages === 1
+                          ? 'Finding a picture for 1 property'
+                          : `Finding pictures for ${workingImages} properties`
+                        : 'Bringing in your stock list'}
+                    </p>
+                    <p className="mt-0.5 text-xs text-muted-foreground">
+                      {workingImages > 0
+                        ? 'Their brochures are being read now. '
+                        : null}
+                      {arrivingUploads > 0
+                        ? 'A stock list is still being processed, so more properties '
+                          + 'will appear here as it finishes. '
+                        : null}
+                      This runs on its own and finishes without you — the list
+                      updates as each one lands, so there is no need to upload the
+                      file again.
+                    </p>
+                  </div>
+                </div>
+              ) : null}
+
               {/*
                 Two presentations of the same rows, the same data and the same
                 controls.
@@ -732,6 +863,44 @@ export default function BuilderStockList() {
                           untouched — deleting and re-uploading a stock list to
                           fix a picture is not a repair.
                         */}
+                        {/*
+                          Ask again for the document links this sheet would not
+                          export. Shown only where there is something to
+                          recover; the server refuses in every other case, so
+                          this is a convenience rather than the control.
+                        */}
+                        {canRefreshBrochureLinks(upload) ? (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            disabled={refreshLinks.isPending || busy}
+                            onClick={() => refreshBrochureLinks(upload)}
+                            aria-label={`Refresh brochure links for ${stockSourceLabel(upload)}`}
+                          >
+                            <Link2 className="h-4 w-4" aria-hidden />
+                            <span className="sr-only sm:not-sr-only sm:ml-2">
+                              Refresh brochure links
+                            </span>
+                          </Button>
+                        ) : null}
+                        {/*
+                          Read the file again with today's parsers. Shown only
+                          on a source that has already been read; the server
+                          refuses the rest, so this is a convenience rather
+                          than the control.
+                        */}
+                        {canReprocess(upload) ? (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            disabled={reprocessSource.isPending || busy}
+                            onClick={() => reprocessStockSource(upload)}
+                            aria-label={`Read ${stockSourceLabel(upload)} again`}
+                          >
+                            <RefreshCw className="h-4 w-4" aria-hidden />
+                            <span className="sr-only sm:not-sr-only sm:ml-2">Read again</span>
+                          </Button>
+                        ) : null}
                         <Button
                           variant="ghost"
                           size="sm"
@@ -1106,26 +1275,69 @@ function PriceBlock({ item }: { item: BuilderStockItem }) {
 function ImageSources({ item, showLabels = false }: { item: BuilderStockItem; showLabels?: boolean }) {
   const image = primaryStockImage(item);
   const stages = stockImageStageSummary(item);
+  /*
+   * WHY A ROW WITHOUT A PICTURE NEEDS THREE DIFFERENT SENTENCES.
+   *
+   * "No image yet" was drawn for a property the engine was actively reading, a
+   * property whose documents had all been read and named nothing, and a
+   * property with no document at all. Only the first is worth waiting for and
+   * only the last two can be acted on — and rendering them identically is why
+   * work in flight looked like a broken product. The rule is in
+   * `imageProgress.pure.ts`; this only draws it.
+   *
+   * Both counts come from the server with the rules the pipeline itself uses,
+   * so this cannot promise a document the pipeline would not read, or claim
+   * work that is not outstanding.
+   */
+  const progress = stockImageProgress({
+    hasImage: !!image,
+    sourceDocuments: item.source_documents ?? 0,
+    workStage: item.image_work_stage,
+  });
+  const working = progress === 'working';
 
   return (
     <div className="flex min-w-0 flex-col items-start gap-1.5">
       <Badge
         variant="outline"
-        title={image ? STOCK_IMAGE_STAGE_BADGES[image.source_stage] : 'No image yet'}
+        title={image
+          ? STOCK_IMAGE_STAGE_BADGES[image.source_stage]
+          : STOCK_IMAGE_PROGRESS_DETAIL[progress]}
         className={cn(
           'max-w-full gap-1 px-1.5 py-0 text-[11px] font-medium',
           image
             ? STOCK_AVAILABILITY_CLASSES.available
-            : 'border-dashed border-border/70 bg-muted/30 text-muted-foreground',
+            : working
+              // Work in flight is a live state, not an absence: solid rather
+              // than dashed, so a glance down the column separates the rows
+              // that need somebody from the rows that need only time.
+              ? 'border-border/70 bg-muted/50 text-foreground'
+              : 'border-dashed border-border/70 bg-muted/30 text-muted-foreground',
         )}
       >
         {image
           ? <ImageIcon className="h-3 w-3 shrink-0" aria-hidden />
-          : <ImageOff className="h-3 w-3 shrink-0" aria-hidden />}
+          : working
+            ? <Loader2 className="h-3 w-3 shrink-0 animate-spin motion-reduce:animate-none" aria-hidden />
+            : <ImageOff className="h-3 w-3 shrink-0" aria-hidden />}
         <span className="truncate">
-          {image ? STOCK_IMAGE_STAGE_BADGES[image.source_stage] : 'No image yet'}
+          {image
+            ? STOCK_IMAGE_STAGE_BADGES[image.source_stage]
+            : STOCK_IMAGE_PROGRESS_LABEL[progress]}
         </span>
       </Badge>
+
+      {/*
+        Whatever else went wrong, somebody can fix this one card. The picture a
+        builder attaches here carries level 1 — they said "this is that
+        property's picture", and nothing was read or inferred to arrive at it —
+        so it outranks anything taken out of a document.
+      */}
+      <BuilderPropertyImageButton
+        stockItemId={item.id}
+        propertyLabel={stockItemTitle(item)}
+        hasImage={!!image}
+      />
 
       <ul className="flex flex-wrap items-center gap-1">
         {stages.map((stage) => {
