@@ -20,6 +20,9 @@ import { describe, expect, it } from 'vitest';
 import {
   negativeProvenanceStillStands,
 } from '../../../supabase/functions/_shared/builderStock/negativeProvenance.pure';
+import {
+  attemptsSoFar, unreachableSoFar,
+} from '../../../supabase/functions/_shared/builderStock/packageAttempt.pure';
 
 import {
   ANNOTATED_VERDICT, CLEAN_VERDICT, cleanPicture, jpegOf, pngOf,
@@ -229,6 +232,11 @@ function fakeDb(seed: {
       in(column: string, value: unknown) { filters.push(['in', column, value]); return builder; },
       limit() { return builder; },
       order() { return builder; },
+      // A paged read asks for one page at a time, because the API caps every
+      // response at `db-max-rows` however large a `.limit()` it is given.
+      range(from: number, to: number) {
+        return Promise.resolve(builder as any).then((page: any) => ({ data: (page?.data ?? []).slice(from, to + 1), error: page?.error ?? null }));
+      },
       maybeSingle() {
         const rows = (tables[table] ?? []).filter((row) => matches(row, filters));
         return Promise.resolve({ data: rows[0] ?? null, error: null });
@@ -1419,6 +1427,55 @@ describe('a package that named no image is not read again', () => {
       .toMatchObject({ provenance_version: PROVENANCE_VERSION });
   });
 
+  /*
+   * THE CARD'S STANDING IMAGE OUTLIVES ITS OWN RE-DERIVATION.
+   *
+   * A version bump rolls a re-derivation across the settled fleet, and the
+   * demote used to run before the primary was re-chosen — so an item whose
+   * package recovery produced nothing this pass lost its pointer, and the
+   * live card read "Finding a picture…" about a property whose picture was
+   * fine minutes earlier (Lot 516 Winterset was the one caught on screen,
+   * mid bump-rollout, 6 September 2026). The pointer now moves first and
+   * the demote spares whichever row is still being pointed at: a pass that
+   * proves nothing leaves the card exactly as it was.
+   */
+  it('a standing primary survives a re-derivation pass that proves nothing new', async () => {
+    const staleRow = {
+      id: 'stale-doc-1',
+      stock_item_id: 'item-NPC-1',
+      organisation_id: 'org-a',
+      source_stage: 'uploaded_document',
+      source_reference: 'the linked document#page1:Im2',
+      processing_status: 'ready',
+      verification_status: 'source_supplied',
+      position: 0,
+      storage_path: 'org/items/item-NPC-1/source/cover.png',
+      source_detail: { ...PRIMARY_ROLE_DETAIL, provenance_version: PROVENANCE_VERSION - 1 },
+    };
+    const db = fakeDb({
+      uploads: [upload],
+      items: [itemFor('NPC-1', '1', { primary_image_id: 'stale-doc-1' })],
+      images: [staleRow],
+      objects: {
+        [upload.storage_path]: new TextEncoder().encode(
+          csvFor([{ ref: 'NPC-1', lot: '1', pkg: FOLDER_A }])),
+      },
+    });
+    const drive = readableButEmpty();
+
+    const outcome = await run(db, { fetchPackage: drive.fetchPackage });
+
+    // The recovery looked and found nothing for this property. That must
+    // cost the card NOTHING: the pointer stands, the row it points at is
+    // still drawable, and no demote fired against the one picture it has.
+    expect(drive.fetched.length).toBeGreaterThan(0);
+    expect(db.tables.builder_stock_items[0].primary_image_id).toBe('stale-doc-1');
+    const row = db.tables.builder_stock_item_images.find(
+      (r: { id: string }) => r.id === 'stale-doc-1');
+    expect(row.processing_status).toBe('ready');
+    expect(outcome.demoted).toBe(0);
+  });
+
   // ── E ────────────────────────────────────────────────────────────────────
   it('E — a changed package is checked, and the old answer does not suppress it', async () => {
     const db = fakeDb({
@@ -1477,21 +1534,36 @@ describe('a package that named no image is not read again', () => {
     /*
      * "We could not look" is not "there is nothing to find".
      *
-     * Asserted as retryability rather than as `undefined`: the recovery now
-     * writes an attempt claim before it starts, so that a worker KILL leaves
-     * evidence, and clears it again on every path where the step returned. A
-     * cleared claim is NULL, which is the same thing as absent to Postgres —
-     * what matters, and what is checked, is that nothing here stands as an
-     * answer, so the package is asked again next tick.
+     * Asserted as RETRYABILITY, which is the rule — not as `undefined`, which
+     * was only ever how the rule happened to be implemented. What is written
+     * now is a count of how many times this link has told us nothing, and a
+     * count is not an answer: `negativeProvenanceStillStands` is false for it,
+     * so the package is asked again next tick exactly as before.
+     *
+     * The count exists because forgetting was not free. Upload `43ffa452` had
+     * thirteen properties claimed every sixty seconds, indefinitely, on links
+     * answering 404 and `Google Drive: Sign-in` — never banked, so never
+     * finished, so never admitted to the fallback ladder that would have given
+     * them a picture. See `builderStockPackageAttempt.test.ts`.
      */
     const afterUnreachable = branchRecord(
       db.tables.builder_stock_items[0].source_provenance_result, FOLDER_A);
-    expect(afterUnreachable ?? null).toBeNull();
     expect(negativeProvenanceStillStands(afterUnreachable, {
       provenanceVersion: PROVENANCE_VERSION,
       packageReference: FOLDER_A,
       sourceAnchor: null,
     })).toBe(false);
+    // One unreadable answer, and no claim on the worker's resource budget.
+    expect(unreachableSoFar(afterUnreachable, {
+      provenanceVersion: PROVENANCE_VERSION,
+      packageReference: FOLDER_A,
+      sourceAnchor: null,
+    })).toBe(1);
+    expect(attemptsSoFar(afterUnreachable, {
+      provenanceVersion: PROVENANCE_VERSION,
+      packageReference: FOLDER_A,
+      sourceAnchor: null,
+    })).toBe(0);
     expect(outcome.incomplete).toBe(true);
   });
 
@@ -1510,16 +1582,21 @@ describe('a package that named no image is not read again', () => {
       fetchPackage: async () => { throw new Error('parser exploded'); },
     });
 
-    // Same rule as F: a claim written before an uninterruptible step is cleared
-    // when that step returns, however it returned.
+    // Same rule as F: the step RETURNED, so nothing stands as an answer and the
+    // package is asked again — while the count of unreadable answers is kept,
+    // because a link that can never be read must not pin the property for ever.
     const afterThrow = branchRecord(
       db.tables.builder_stock_items[0].source_provenance_result, FOLDER_A);
-    expect(afterThrow ?? null).toBeNull();
     expect(negativeProvenanceStillStands(afterThrow, {
       provenanceVersion: PROVENANCE_VERSION,
       packageReference: FOLDER_A,
       sourceAnchor: null,
     })).toBe(false);
+    expect(unreachableSoFar(afterThrow, {
+      provenanceVersion: PROVENANCE_VERSION,
+      packageReference: FOLDER_A,
+      sourceAnchor: null,
+    })).toBe(1);
     expect(outcome.incomplete).toBe(true);
   });
 
@@ -1841,3 +1918,4 @@ describe('what the Builder Stock card displays', () => {
     expect(await chooseAndStorePrimaryImage(db, 'item-1')).toBe('was-a-tile');
   });
 });
+

@@ -15,13 +15,15 @@
  * body is a lookup key, never authority.
  *
  * Operations
- *   create_upload | process_upload | enrich_images
+ *   create_upload | process_upload | reprocess_upload | enrich_images
+ *   create_builder_image | attach_builder_image
  *   list_uploads | get_upload
  *   list_stock | get_stock_item | set_availability | archive_stock_item
  *   image_url
  *   list_selections | acknowledge_selection
  */
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.55.0';
+import { unreadDocumentCount } from '../_shared/builderStock/imageProgress.pure.ts';
 import { createCorsHeaders } from '../_shared/auth.ts';
 import { enforceCsrf, csrfDenied } from '../_shared/csrfGuard.ts';
 import {
@@ -39,9 +41,41 @@ import {
 import {
   runStockImport, type RunImportResult,
 } from '../_shared/builderStock/runImport.ts';
-import { sourceAccessNoticeFor } from '../_shared/builderStock/sourceAccessNotice.pure.ts';
+import {
+  SOURCE_LINKS_UNAVAILABLE, sourceAccessNoticeFor,
+} from '../_shared/builderStock/sourceAccessNotice.pure.ts';
+import {
+  linkRecoveryWebhookConfigured, requestLinkRecovery,
+} from '../_shared/builderStock/requestLinkRecovery.ts';
+import {
+  MANUAL_REFRESH_WINDOW_SECONDS, isRecoverableStoredAvailability, projectUploadListRow,
+  shouldRequestLinkRecovery,
+} from '../_shared/builderStock/linkRecovery.pure.ts';
+import {
+  parseIsAbandoned, settleUploadCompletion,
+} from '../_shared/builderStock/uploadCompletion.ts';
+import { googleSheetsRef } from '../_shared/builderStock/googleSheetsSource.pure.ts';
+import {
+  isTraversableBranch, rowSourceBranches,
+} from '../_shared/builderStock/sourceBranches.pure.ts';
+import {
+  designOfStoredRow, isBuilderSuppliedPath, propertyImageStoragePath,
+} from '../_shared/builderStock/builderSuppliedImage.pure.ts';
+import {
+  attachBuilderImage, builderImageReference,
+} from '../_shared/builderStock/attachBuilderImage.ts';
+import {
+  roleFromBuilderProperty,
+} from '../_shared/builderStock/sourceImageRole.pure.ts';
+import { validateSourceImageBytes } from '../_shared/builderStock/sourceAssets.pure.ts';
+import { PROCESSED_LIFECYCLE } from '../_shared/builderStock/stockLifecycle.pure.ts';
+import { sha256Hex } from '../_shared/builderStock/rasterPng.ts';
+import { consumeRateLimit } from '../_shared/requestSecurity.ts';
 import { fetchStockSource, SourceFetchError } from '../_shared/builderStock/fetchSource.ts';
 import type { HyperlinkAvailability } from '../_shared/builderStock/sheetHyperlinks.pure.ts';
+import {
+  linkDiscoveryFromAvailability,
+} from '../_shared/builderStock/suppliedEvidence.pure.ts';
 import {
   NOTION_NOT_PUBLIC_MESSAGE, normaliseStockSourceUrl, snapshotFileName,
   stockSourceDisplayName,
@@ -66,6 +100,7 @@ import {
   settleUploadSourceImages, uploadsNeedingSettlement,
 } from '../_shared/builderStock/settleSourceImages.ts';
 import { newRepairBudget } from '../_shared/builderStock/settleImageSanitization.ts';
+import { readAllRows } from '../_shared/builderStock/pagedRead.ts';
 import {
   BUILDER_SELECTION_SELECT, STOCK_AVAILABILITY_STATUSES, STOCK_IMAGE_SELECT,
   STOCK_ITEM_SELECT, STOCK_UPLOAD_SELECT, stockPagination,
@@ -231,6 +266,8 @@ Deno.serve(async (req) => {
        * failure. See `sourceAccessNotice.pure.ts`.
        */
       sourceHyperlinks?: HyperlinkAvailability,
+      /** The URL the rows came from, for a Google Sheets recovery ask. */
+      sourceUrlForRecovery?: string | null,
     ) => {
       if (!result.ok) {
         if (result.code === 'duplicate_file') {
@@ -261,7 +298,44 @@ Deno.serve(async (req) => {
        * A row-level failure still wins the message, because rows that could
        * not be saved are the more serious of the two.
        */
-      const sourceNotice = sourceAccessNoticeFor(sourceHyperlinks);
+      /**
+     * Ask for this sheet's link addresses, where all four conditions hold.
+     *
+     * Every refusal is silent and operational: this is an auxiliary recovery,
+     * so a builder whose sheet is not a Google Sheet, or whose links were read
+     * cleanly, sees no difference from one whose recovery ran.
+     */
+    const maybeRequestLinkRecovery = async (
+      recoveryUploadId: string,
+      sourceUrl: string | null | undefined,
+      availability: HyperlinkAvailability | null | undefined,
+    ): Promise<void> => {
+      try {
+        const ref = googleSheetsRef(sourceUrl ?? null);
+        if (!shouldRequestLinkRecovery({
+          importSucceeded: true,
+          availability,
+          spreadsheetId: ref?.spreadsheetId ?? null,
+          webhookConfigured: linkRecoveryWebhookConfigured(),
+        })) return;
+
+        await requestLinkRecovery(supabase, {
+          organisationId: activeOrganisationId,
+          uploadId: recoveryUploadId,
+          spreadsheetId: ref!.spreadsheetId,
+          gid: ref!.gid,
+          origin: 'import',
+        });
+      } catch (error) {
+        // NEVER FATAL. The import is already complete and recorded.
+        console.warn('[builder-portal-stock] link recovery could not be requested', {
+          phase: 'link_recovery_dispatch', upload_id: recoveryUploadId,
+          detail: String((error as { message?: string })?.message ?? error).slice(0, 160),
+        });
+      }
+    };
+
+    const sourceNotice = sourceAccessNoticeFor(sourceHyperlinks);
       const { data: updated } = await supabase.from('builder_stock_uploads').update({
         status: result.uploadStatus,
         records_detected: result.summary.detected,
@@ -278,6 +352,21 @@ Deno.serve(async (req) => {
         processing_completed_at: new Date().toISOString(),
       }).eq('id', uploadId).eq('organisation_id', activeOrganisationId)
         .select(STOCK_UPLOAD_SELECT).single();
+
+      /*
+       * A SHEET THAT GAVE US ITS ROWS AND NOT ITS LINK ADDRESSES MAY BE
+       * READABLE BY SOMEBODY ELSE.
+       *
+       * `unavailable_source_export` means the workbook itself never arrived —
+       * the one reading a different, authorised reader can change. Every other
+       * reading either has the links already or had the file and could not use
+       * it, and asking again would spend a metered operation to learn nothing.
+       *
+       * AFTER the upload row is written and BEFORE nothing: the import is
+       * already complete and its result is already recorded, so this cannot
+       * delay, alter or fail it. `requestLinkRecovery` never throws.
+       */
+      await maybeRequestLinkRecovery(uploadId, sourceUrlForRecovery, sourceHyperlinks);
 
       await logBuilderProjectActivity(supabase, req, {
         builderUserId: me.id, organisationId: activeOrganisationId,
@@ -437,6 +526,261 @@ Deno.serve(async (req) => {
         console.error('[builder-portal-stock] processing failed', error);
         return await failUpload(upload.id, 'processing_failed',
           'That file could not be processed. Please check the format and try again.',
+          (error as { message?: string })?.message);
+      }
+    }
+
+    /*
+     * =====================================================================
+     * The picture a builder hands over directly
+     * =====================================================================
+     *
+     * Every image this product serves is READ out of something — a column
+     * naming a URL, a brochure page naming a lot, a page cover. That works
+     * until there is nothing to read, and on the one live source thirteen of
+     * twenty-six published properties attach no document at all. The
+     * pipeline's fallbacks then offered a Simonds display home, an ABC Homes
+     * display home and the land developer's estate marketing for those rows,
+     * and refused all three, correctly. The cards were blank because there was
+     * nothing to read, and no reader fixes that.
+     *
+     * So the builder can hand the picture over. Two routes, one act: a render
+     * FOR A DESIGN, which serves every row of theirs stating it — three
+     * uploads cover those thirteen properties and every future one — or a
+     * picture FOR ONE PROPERTY, which is the exception and the guarantee.
+     *
+     * Uploaded exactly as a stock list is: a signed URL, the browser PUTs to
+     * it, and a second call confirms. The bytes are validated SERVER-SIDE on
+     * that second call, out of storage, so what is registered is what was
+     * actually stored rather than what the browser said it sent.
+     */
+    if (operation === 'create_builder_image') {
+      if (!await can('edit')) {
+        return json({ error: 'You do not have permission to add images', code: 'permission_denied' }, 403);
+      }
+
+      const filename = cleanText(body.filename, 200) || 'image';
+      const stockItemId = cleanText(body.stock_item_id, 64);
+      if (!stockItemId) {
+        return json({ error: 'Say which property this picture is for.' }, 400);
+      }
+
+      const item = await loadItem(stockItemId);
+      if (!item) return json({ error: 'Property not found' }, 404);
+      const storagePath = propertyImageStoragePath({
+        organisationId: activeOrganisationId,
+        stockItemId,
+        filename: safeObjectName(filename),
+      });
+      const { data: signed, error: signError } = await supabase.storage
+        .from(STOCK_IMAGE_BUCKET)
+        .createSignedUploadUrl(storagePath);
+      if (signError || !signed?.signedUrl) {
+        console.error('[builder-portal-stock] builder image signed url failed', {
+          bucket: STOCK_IMAGE_BUCKET,
+          storage_path: storagePath,
+          message: signError?.message ?? 'no signed url returned',
+        });
+        return json({ error: 'Storage could not accept the image.' }, 502);
+      }
+      const raw = signed.signedUrl;
+      return json({
+        success: true,
+        storage_path: storagePath,
+        upload_url: raw.startsWith('http')
+          ? raw
+          : `${Deno.env.get('SUPABASE_URL')}/storage/v1${raw.startsWith('/') ? '' : '/'}${raw}`,
+        token: signed.token,
+      });
+    }
+
+    if (operation === 'attach_builder_image') {
+      if (!await can('edit')) {
+        return json({ error: 'You do not have permission to add images', code: 'permission_denied' }, 403);
+      }
+
+      const storagePath = cleanText(body.storage_path, 400);
+      /*
+       * The path arrives in the body and is therefore a LOOKUP KEY, never
+       * authority — the same rule every other write in this function keeps.
+       * It must be one this product wrote, under this organisation's own
+       * prefix, or a caller could register somebody else's object.
+       */
+      if (!isBuilderSuppliedPath(storagePath) || !storagePath.includes(`/${activeOrganisationId}/`)) {
+        return json({ error: 'That image location is not allowed' }, 400);
+      }
+
+      const { data: blob, error: downloadError } = await supabase.storage
+        .from(STOCK_IMAGE_BUCKET).download(storagePath);
+      if (downloadError || !blob) {
+        return json({ error: 'That image was not uploaded. Please try again.' }, 400);
+      }
+      const bytes = new Uint8Array(await blob.arrayBuffer());
+      /*
+       * VALIDATED OUT OF STORAGE, not off the request. What is registered is
+       * what was actually stored, so a browser cannot declare a PNG and put a
+       * PDF there — and the size, format and minimum-dimension rules are the
+       * ones every other source image already passes.
+       */
+      const checked = validateSourceImageBytes(bytes);
+      if (checked.ok !== true) {
+        await supabase.storage.from(STOCK_IMAGE_BUCKET).remove([storagePath]);
+        return json({ error: checked.reason }, 400);
+      }
+      const sha256 = await sha256Hex(bytes);
+
+      const stockItemId = cleanText(body.stock_item_id, 64);
+      const suppliedBy = 'builder' as const;
+
+      /*
+       * ONE PROPERTY, ALWAYS. A builder-supplied picture names the property it
+       * is of, and nothing here fans one picture across several — see the
+       * module header for why that capability was withdrawn.
+       */
+      if (!stockItemId) {
+        return json({ error: 'Say which property this picture is for.' }, 400);
+      }
+      {
+        const item = await loadItem(stockItemId);
+        if (!item) return json({ error: 'Property not found' }, 404);
+        const attached = await attachBuilderImage(supabase, {
+          organisationId: activeOrganisationId,
+          stockItemId,
+          uploadId: item.upload_id ?? null,
+          storageBucket: STOCK_IMAGE_BUCKET,
+          storagePath,
+          contentType: checked.contentType,
+          byteSize: bytes.length,
+          sha256,
+          role: roleFromBuilderProperty({
+            suppliedBy,
+            property: stockPropertyLabel(item),
+          }),
+        });
+        if ('error' in attached) return json({ error: 'The image could not be stored.' }, 500);
+        // `attachBuilderImage` requeues the property itself — see its header.
+        await logBuilderProjectActivity(supabase, req, {
+          builderUserId: me.id, organisationId: activeOrganisationId,
+          action: 'builder_stock_image_supplied',
+          entityType: 'stock_item', entityId: stockItemId,
+          metadata: { storage_path: storagePath, scope: 'property' },
+        });
+        return json({ success: true, scope: 'property', properties: 1 });
+      }
+    }
+
+    /*
+     * =====================================================================
+     * Re-read a source this organisation already imported
+     * =====================================================================
+     *
+     * THE READERS IMPROVE, AND WHAT THEY LEARN HAS TO REACH ROWS THAT ALREADY
+     * EXIST. A stock list is read once at upload and never again, so every
+     * correction to the parsers — a column mapping, a link target, a page
+     * rule — applied only to the NEXT builder's file. The rows already
+     * published kept whatever the reader believed on the day.
+     *
+     * Measured on the one live source: its brochure links were discarded
+     * because an uploaded workbook was read for its values alone, and its
+     * `LAND $` column was written into `land_size_sqm`, so twenty-six
+     * published properties carried a 428,000 m2 block, no price and no
+     * document. Both are fixed in the readers; neither reaches those rows
+     * without re-reading the file.
+     *
+     * AND RE-UPLOADING IS NOT THE ANSWER. A unique index on
+     * `(organisation_id, file_sha256)` refuses the same bytes twice — rightly,
+     * because a builder who uploads their list again is usually doing it by
+     * accident — so the only route was to DELETE the source and upload it
+     * again, which discards the audit trail and every selection made against
+     * those properties.
+     *
+     * It is the SAME `runStockImport` the first pass ran, on the SAME bytes
+     * out of the same private bucket. Nothing here re-implements an import:
+     * the rows are matched by the identity rule the import already uses and
+     * updated in place, so a property keeps its id, its history and anything a
+     * client has done with it.
+     *
+     * The one precondition is that a run is not already in flight. Every other
+     * status may be re-read, which is the difference from `process_upload` —
+     * that operation's guard exists to stop a double-click importing a file
+     * twice, and this operation's whole purpose is to import it again.
+     */
+    if (operation === 'reprocess_upload') {
+      if (!await can('edit')) {
+        return json({ error: 'You do not have permission to upload stock', code: 'permission_denied' }, 403);
+      }
+
+      const upload = await loadUpload(cleanText(body.upload_id, 64));
+      if (!upload) return json({ error: 'Upload not found' }, 404);
+      if (upload.deleted_at) return json({ error: 'Upload not found' }, 404);
+      if (!isAcceptableStockStoragePath(upload.storage_path)) {
+        return json({ error: 'That file location is not allowed' }, 400);
+      }
+      /*
+       * A LIVE READ IS REFUSED; AN ABANDONED ONE IS THE WHOLE POINT OF THIS
+       * OPERATION. A request killed on its resource limit leaves the row at
+       * `parsing` for ever, and both doors then refuse it — `process_upload`
+       * with "already processed" and this one with "being read right now",
+       * neither of which is true. See `parseIsAbandoned`.
+       */
+      if (String(upload.status) === 'parsing' && !parseIsAbandoned(upload)) {
+        return json({
+          error: 'This source is being read right now. Try again when it finishes.',
+          code: 'already_processing',
+          upload,
+        }, 409);
+      }
+      // Nothing has been read yet, so this is an ordinary first pass and the
+      // builder should be sent to the operation that performs one — which
+      // reports its own progress and its own duplicate refusal.
+      if (['uploaded', 'failed'].includes(String(upload.status))) {
+        return json({
+          error: 'This source has not been read yet. Process it instead.',
+          code: 'not_yet_processed',
+          upload,
+        }, 409);
+      }
+
+      await markParsing(upload.id);
+
+      try {
+        const { data: blob, error: downloadError } = await supabase.storage
+          .from(upload.storage_bucket).download(upload.storage_path);
+        if (downloadError || !blob) {
+          return await failUpload(upload.id, 'file_missing',
+            'The stored file could not be read, so it cannot be re-read.', downloadError?.message);
+        }
+
+        /*
+         * A RE-READ RUNS ON THE STORED BYTES, so what it can see of a Google
+         * Sheet's links is exactly what the ORIGINAL fetch saw: a stored CSV
+         * from a resolved fetch carries the merged URL columns in its own
+         * text, and one from a refused fetch carries labels with no targets
+         * anywhere. The refusal was recorded on the upload row when it
+         * happened (`sourceAccessNoticeFor` → `error_detail.reason`), so it is
+         * read back here and stamped onto the re-written rows — a re-read
+         * must not launder "we could not see the links" into "there are no
+         * links".
+         */
+        const storedAvailability = upload.error_code === SOURCE_LINKS_UNAVAILABLE
+          ? String((upload.error_detail as { reason?: string } | null)?.reason
+            ?? 'unavailable_source_export')
+          : null;
+        const result = await runStockImport({
+          supabase,
+          organisationId: activeOrganisationId,
+          organisationName,
+          builderUserId: me.id,
+          upload: { id: upload.id, original_filename: upload.original_filename },
+          bytes: new Uint8Array(await blob.arrayBuffer()),
+          sourceKind: 'file',
+          linkDiscovery: linkDiscoveryFromAvailability(storedAvailability),
+        });
+        return await finishImport(upload.id, result, { reprocessed: true });
+      } catch (error) {
+        console.error('[builder-portal-stock] reprocessing failed', error);
+        return await failUpload(upload.id, 'processing_failed',
+          'That source could not be re-read. Please check the format and try again.',
           (error as { message?: string })?.message);
       }
     }
@@ -719,6 +1063,15 @@ Deno.serve(async (req) => {
           isNotionSource: normalised.isNotion,
           baseUrl: fetched.finalUrl,
           rowAssets: sourceRowAssets,
+          /*
+           * A Google Sheet's link targets travel SEPARATELY from its proven
+           * CSV, so the fetch's own reading of how that went is stamped onto
+           * every row this import writes. `null` for every other kind of URL —
+           * their links are native to the fetched bytes, and `runStockImport`
+           * stamps them from the strategy that read them.
+           */
+          linkDiscovery: linkDiscoveryFromAvailability(
+            fetched.hyperlinks, fetched.hyperlinkMethod),
         });
 
         /**
@@ -741,7 +1094,7 @@ Deno.serve(async (req) => {
           strategy_source: 'url',
           ...(notionDiagnostics ? { notion_recovery: notionDiagnostics.recovery_ok } : {}),
           ...(fetched.hyperlinks ? { source_hyperlinks: fetched.hyperlinks } : {}),
-        }, fetched.hyperlinks);
+        }, fetched.hyperlinks, normalised.url);
       } catch (error) {
         console.error('[builder-portal-stock] url processing failed', error);
         return await failUpload(uploadId, 'processing_failed',
@@ -830,9 +1183,19 @@ Deno.serve(async (req) => {
       /**
        * Settle EVERY property, not only the ones this run touched.
        *
-       * A property whose builder supplied nothing must end the run with no
-       * primary image rather than the Street View it had before the rule
-       * changed — that stale pointer IS the defect being repaired.
+       * A property whose pointer no longer matches what the ranking would pick
+       * — an image re-judged a marketing tile since it was chosen, a builder
+       * cover that has arrived for a property showing a fallback — must end the
+       * run pointing at the current answer rather than the old one.
+       *
+       * It settles to the SAME ranking the per-item path uses
+       * (`chooseCardImage`). This comment used to say the opposite: that a
+       * property whose builder supplied nothing must end with no image "rather
+       * than the Street View it had before the rule changed". That was true of
+       * the builder-or-nothing rule and stopped being true when
+       * `imagePriority.pure.ts` reinstated the fallback tiers; the function it
+       * describes went on enforcing the repealed rule, and this operation is
+       * the caller that could reach it. See `enforceStrictPrimaryImages`.
        */
       const primaries = await enforceStrictPrimaryImages(supabase, activeOrganisationId);
 
@@ -983,31 +1346,22 @@ Deno.serve(async (req) => {
        */
       const outstanding = (remaining ?? 0) + settlementRemaining;
 
+      /*
+       * THE UPLOAD'S OWN STATUS IS SETTLED BY THE SHARED RULE.
+       *
+       * This block used to be the ONLY place an import was marked finished,
+       * and it runs only while somebody has this page open — so an import
+       * that completed headlessly stayed `enriching` with an empty
+       * `image_stage_summary` for ever. `uploadCompletion.ts` holds the rule
+       * now and the settler's tick asks it too; the call here keeps a person
+       * who IS watching from waiting on a tick, and the decision is the same
+       * either way. It also no longer writes a summary from an incomplete
+       * read — see that module's header.
+       */
       if (uploadId && !remaining) {
-        const upload = await loadUpload(uploadId);
-        // `partially_complete` as well as `enriching`. An upload with even one
-        // unsaveable row is set straight to `partially_complete` at import, so
-        // testing for `enriching` alone left `image_stage_summary` empty for
-        // ever on exactly those uploads — the audit record then said nothing
-        // about image processing precisely where a reader most wants it.
-        if (upload && ['enriching', 'partially_complete'].includes(String(upload.status))) {
-          const { data: stageCounts } = await supabase
-            .from('builder_stock_item_images')
-            .select('source_stage, processing_status')
-            .eq('upload_id', uploadId)
-            .limit(5000);
-          const summary: Record<string, Record<string, number>> = {};
-          for (const row of stageCounts ?? []) {
-            const stage = String((row as any).source_stage);
-            const state = String((row as any).processing_status);
-            summary[stage] = summary[stage] ?? {};
-            summary[stage][state] = (summary[stage][state] ?? 0) + 1;
-          }
-          await supabase.from('builder_stock_uploads').update({
-            status: upload.records_failed > 0 ? 'partially_complete' : 'complete',
-            image_stage_summary: summary,
-          }).eq('id', uploadId);
-        }
+        await settleUploadCompletion(supabase, {
+          uploadId, organisationId: activeOrganisationId,
+        });
       }
 
       return json({
@@ -1024,9 +1378,16 @@ Deno.serve(async (req) => {
 
     if (operation === 'list_uploads') {
       const { page, pageSize, from, to } = stockPagination(body);
+      /*
+       * `error_detail` is read here and never sent: `projectUploadListRow`
+       * strips it and answers `link_recovery_available` in its place, the
+       * same read `refresh_brochure_links` makes — so the page can offer the
+       * act exactly where the server would accept it, without ever seeing
+       * the diagnosis.
+       */
       const { data, count } = await supabase
         .from('builder_stock_uploads')
-        .select(STOCK_UPLOAD_SELECT, { count: 'exact' })
+        .select(`${STOCK_UPLOAD_SELECT}, error_detail`, { count: 'exact' })
         .eq('organisation_id', activeOrganisationId)
         // A deleted source leaves the builder's active history. The row stays
         // for the stock and the selections that reference it.
@@ -1035,7 +1396,7 @@ Deno.serve(async (req) => {
         .range(from, to);
       return json({
         success: true,
-        records: data ?? [],
+        records: (data ?? []).map(projectUploadListRow),
         pagination: {
           page, page_size: pageSize, total: count ?? 0,
           total_pages: Math.max(1, Math.ceil((count ?? 0) / pageSize)),
@@ -1046,10 +1407,12 @@ Deno.serve(async (req) => {
     if (operation === 'get_upload') {
       const upload = await loadUpload(cleanText(body.upload_id, 64));
       if (!upload) return json({ error: 'Upload not found' }, 404);
-      // `error_detail` is stripped: the row is selected in full above so the
-      // handler can read it, and projected here so the browser cannot.
-      const { error_detail: _internal, storage_path: _path, ...safe } = upload;
-      return json({ success: true, record: safe });
+      // The row is selected in full above so the handler can read it;
+      // `projectUploadListRow` keeps `error_detail` off the wire and answers
+      // `link_recovery_available` in its place, and `storage_path` stays
+      // internal too.
+      const { storage_path: _path, ...safe } = upload;
+      return json({ success: true, record: projectUploadListRow(safe) });
     }
 
     if (operation === 'list_stock') {
@@ -1181,6 +1544,89 @@ Deno.serve(async (req) => {
     // Removing a stock-list source
     // =====================================================================
 
+    /*
+     * "Refresh brochure links" — the same recovery, asked again by hand.
+     *
+     * OFFERED ONLY WHERE IT CAN DO SOMETHING. The upload must be this
+     * organisation's, must be a Google Sheets source, and must currently carry
+     * the one availability an authorised re-read can change. Anything else is
+     * refused rather than quietly doing nothing, so the button in the portal
+     * and the server agree about when it applies.
+     *
+     * It re-reads the SOURCE ONLY. No rows are re-imported, no stock data is
+     * touched, and nothing about the marketplace changes until stage 1 opens a
+     * recovered document through the pipeline that already exists.
+     */
+    if (operation === 'refresh_brochure_links') {
+      const uploadId = String(body.upload_id || '');
+      if (!uploadId) return json({ success: false, error: 'upload_id is required.' }, 400);
+
+      const { data: upload } = await supabase.from('builder_stock_uploads')
+        .select('id, source_type, source_url, error_code, error_detail, deleted_at')
+        .eq('id', uploadId).eq('organisation_id', activeOrganisationId).maybeSingle();
+      if (!upload || upload.deleted_at) {
+        return json({ success: false, error: 'That stock list was not found.' }, 404);
+      }
+
+      /*
+       * The upload's OWN recorded reason, and both spellings of it. A row
+       * written before that reading was split in two carries the old name; it
+       * describes the same restricted export and the same act recovers it.
+       */
+      const availability = (upload.error_detail ?? {})?.reason ?? null;
+      if (!isRecoverableStoredAvailability(availability)) {
+        return json({
+          success: false,
+          error: 'This stock list does not have brochure links waiting to be recovered.',
+        }, 409);
+      }
+
+      const ref = googleSheetsRef(upload.source_url);
+      if (!ref) {
+        return json({ success: false, error: 'This stock list is not a Google Sheet.' }, 409);
+      }
+
+      if (!linkRecoveryWebhookConfigured()) {
+        return json({
+          success: false,
+          error: 'Brochure link recovery is not configured for this deployment.',
+        }, 409);
+      }
+
+      // One refresh per upload per window, on the SERVER, so a disabled button
+      // is a convenience rather than the control.
+      const limit = await consumeRateLimit(
+        supabase, `bs:link-refresh:${uploadId}`, 1, MANUAL_REFRESH_WINDOW_SECONDS);
+      if (!limit.allowed) {
+        return json({
+          success: false,
+          error: 'Brochure links were refreshed for this list recently. Try again shortly.',
+        }, 429);
+      }
+
+      const outcome = await requestLinkRecovery(supabase, {
+        organisationId: activeOrganisationId,
+        uploadId,
+        spreadsheetId: ref.spreadsheetId,
+        gid: ref.gid,
+        origin: 'manual_refresh',
+      });
+
+      await logBuilderProjectActivity(supabase, req, {
+        builderUserId: me.id, organisationId: activeOrganisationId,
+        action: 'builder_stock_brochure_links_refresh_requested',
+        entityType: 'stock_upload', entityId: uploadId,
+        metadata: { requested: outcome.requested },
+      });
+
+      return json({
+        success: outcome.requested,
+        requested: outcome.requested,
+        error: outcome.requested ? undefined
+          : 'Brochure links could not be requested just now. Your stock list is unchanged.',
+      }, outcome.requested ? 200 : 503);
+    }
+
     if (operation === 'delete_upload') {
       // Removing a source is a delete, so it needs the delete level — adding
       // one only needs edit.
@@ -1195,17 +1641,26 @@ Deno.serve(async (req) => {
 
       // Everything this organisation holds that named the source. Read before
       // anything changes, so the decision is made against stored state.
-      const { data: items } = await supabase
+      /*
+       * PAGED, and a failed read refuses the whole act. `.limit(20000)` is
+       * capped at 1,000 by the API, and this list decides which properties a
+       * source deletion ARCHIVES — so a truncated read silently spares stock
+       * the builder asked to remove, and an errored one would read as an
+       * upload supplying nothing at all. See `pagedRead.ts`.
+       */
+      const itemPage = await readAllRows<{
+        id: string; upload_id: string | null;
+        first_upload_id: string | null; lifecycle_status: string | null;
+      }>(() => supabase
         .from('builder_stock_items')
         .select('id, upload_id, first_upload_id, lifecycle_status')
         .eq('organisation_id', activeOrganisationId)
         .or(`upload_id.eq.${upload.id},first_upload_id.eq.${upload.id}`)
-        .limit(20000);
-
-      const rows = (items ?? []) as Array<{
-        id: string; upload_id: string | null;
-        first_upload_id: string | null; lifecycle_status: string | null;
-      }>;
+        .order('id', { ascending: true }));
+      if (itemPage.failed) {
+        return json({ success: false, error: 'stock_could_not_be_read' }, 503);
+      }
+      const rows = itemPage.rows;
       // The rule lives in `sourceDeletion.pure.ts`: only stock this source is
       // CURRENTLY supplying is deactivated. A property re-supplied by a newer
       // list keeps standing, which is the whole point of storing both ids.
@@ -1378,6 +1833,41 @@ Deno.serve(async (req) => {
  * One query per collection rather than per row: a 100-row stock page must not
  * become 201 round trips.
  */
+
+/** How a property is named to a person, for the record a role assignment writes. */
+function stockPropertyLabel(item: Record<string, unknown>): string {
+  const parts = [
+    item.lot_number ? `Lot ${String(item.lot_number)}` : '',
+    String(item.address_line ?? ''),
+    String(item.development_name ?? ''),
+    String(item.suburb ?? ''),
+  ].map((part) => part.trim()).filter(Boolean);
+  return parts.join(', ') || 'this property';
+}
+
+/**
+ * Put properties back in front of the image ladder.
+ *
+ * The link recovery's rule, in its own words: reopened only where there is
+ * something to gain. A property already holding a picture is left alone —
+ * except that here the picture may BE the one just supplied, so the sweep is
+ * what re-decides the card, not this.
+ */
+async function reopenImageWork(
+  supabase: any,
+  organisationId: string,
+  stockItemIds: string[],
+): Promise<void> {
+  if (!stockItemIds.length) return;
+  await supabase.from('builder_stock_items').update({
+    enrichment_status: 'pending',
+    image_work_stage: 'source',
+    image_work_claim_until: null,
+    image_work_next_attempt_at: new Date().toISOString(),
+    image_work_updated_at: new Date().toISOString(),
+  }).eq('organisation_id', organisationId).in('id', stockItemIds);
+}
+
 async function decorateItems(
   supabase: any,
   items: any[],
@@ -1386,7 +1876,7 @@ async function decorateItems(
   if (!items.length) return [];
   const ids = items.map((item) => item.id);
 
-  const [{ data: images }, { data: selections }] = await Promise.all([
+  const [{ data: images }, { data: selections }, { data: rows }] = await Promise.all([
     supabase.from('builder_stock_item_images')
       .select(STOCK_IMAGE_SELECT)
       .in('stock_item_id', ids)
@@ -1397,6 +1887,24 @@ async function decorateItems(
       .in('stock_item_id', ids)
       .eq('organisation_id', organisationId)
       .neq('status', 'withdrawn'),
+    /*
+     * WHY A PROPERTY HAS NO PICTURE, WHERE THE ANSWER IS THE BUILDER'S TO FIX.
+     *
+     * Read here rather than added to `STOCK_ITEM_SELECT`, because that list is
+     * a disclosure boundary and `source_row` is the builder's whole raw row.
+     * What leaves this function is a COUNT — how many documents this property's
+     * own row attaches — and never an address, so the page can say "your stock
+     * list attaches no document to this row" without the row travelling.
+     *
+     * On the one live source that is thirteen of twenty-six properties, and it
+     * is the only reason among them that a person can act on: no reader
+     * conjures a document nobody attached, and until this the page said only
+     * "No image yet", which reads as something the product is still doing.
+     */
+    supabase.from('builder_stock_items')
+      .select('id, source_row, source_provenance_result')
+      .in('id', ids)
+      .eq('organisation_id', organisationId),
   ]);
 
   const imagesByItem = new Map<string, any[]>();
@@ -1412,9 +1920,45 @@ async function decorateItems(
     selectionsByItem.set(selection.stock_item_id, list);
   }
 
+  /*
+   * Counted with `rowSourceBranches` — the same function the image pipeline
+   * uses to decide what it will try — so the page cannot say a property has a
+   * document the pipeline would not read, or none where it would find five.
+   */
+  const documentsByItem = new Map<string, number>();
+  const unreadByItem = new Map<string, { unprocessed: number; unreachable: number }>();
+  for (const row of rows ?? []) {
+    const unmapped = (row?.source_row as { unmapped?: Record<string, string> } | null)?.unmapped;
+    documentsByItem.set(
+      String(row.id),
+      rowSourceBranches(unmapped).filter(isTraversableBranch).length,
+    );
+    unreadByItem.set(
+      String(row.id),
+      unreadDocumentCount((row as { source_provenance_result?: unknown })
+        ?.source_provenance_result ?? null),
+    );
+  }
+
   return items.map((item) => ({
     ...item,
     images: imagesByItem.get(item.id) ?? [],
+    /*
+     * How many builder documents this property's own row attaches. Zero is the
+     * one reason for a missing picture that the builder can fix, and it is a
+     * count rather than a list because an address is not needed to say so.
+     */
+    source_documents: documentsByItem.get(String(item.id)) ?? 0,
+    /*
+     * And how many we could not read, split by WHOSE failure it was. Counts,
+     * never reasons — see `unreadDocumentCount`: the mechanism stays on this
+     * side. They are two fields because they lead to two different sentences,
+     * and one of those sentences asks the builder to go and check something.
+     */
+    source_documents_unprocessed:
+      unreadByItem.get(String(item.id))?.unprocessed ?? 0,
+    source_documents_unreachable:
+      unreadByItem.get(String(item.id))?.unreachable ?? 0,
     // The builder's activation signal: how many Command Centre selections this
     // property has, and where the most recent one is up to.
     selection_count: (selectionsByItem.get(item.id) ?? []).length,

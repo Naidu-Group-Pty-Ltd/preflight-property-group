@@ -32,7 +32,9 @@ import { join } from 'node:path';
 import {
   attemptsSoFar, packageAttemptsExhausted, recordPackageAttempt,
   recordPackageUnprocessable, provenanceAfterAttempt,
-  MAX_PACKAGE_ATTEMPTS, PACKAGE_RECOVERY_ATTEMPT,
+  recordUnreachableAttempt, recordPackageUnreachable, unreachableSoFar,
+  unreachableAttemptsExhausted,
+  MAX_PACKAGE_ATTEMPTS, MAX_UNREACHABLE_ATTEMPTS, PACKAGE_RECOVERY_ATTEMPT,
 } from '../../../supabase/functions/_shared/builderStock/packageAttempt.pure';
 import {
   negativeProvenanceStillStands, recordNoDeterministicImage,
@@ -80,12 +82,13 @@ describe('the reproduced defect — repeated kills on one package', () => {
     () => {
       let stored: unknown = null;
 
-      // Tick 1 and tick 2 are killed mid-recovery.
-      stored = killedTick(stored);
-      expect(packageAttemptsExhausted(stored, question())).toBe(false);
-      stored = killedTick(stored);
+      // Every tick up to the budget is killed mid-recovery…
+      for (let kill = 0; kill < MAX_PACKAGE_ATTEMPTS; kill += 1) {
+        expect(packageAttemptsExhausted(stored, question())).toBe(false);
+        stored = killedTick(stored);
+      }
 
-      // Tick 3 refuses to start the work that killed the previous two.
+      // …and the next one refuses to start the work that killed them all.
       expect(packageAttemptsExhausted(stored, question())).toBe(true);
 
       const verdict = recordPackageUnprocessable(question());
@@ -104,18 +107,28 @@ describe('the reproduced defect — repeated kills on one package', () => {
     expect(verdict.detail).not.toMatch(/names no|empty/i);
   });
 
-  it('gives a package more than one chance, because a kill can be transient', () => {
+  it('gives a package more than one chance, and not unbounded ones', () => {
+    // A kill can be transient — measured on 2 Sep 2026: a requeue burst drew
+    // seven CPU kills in three minutes and retired 5 MB documents that read
+    // in three seconds on a clean isolate, at the old budget of two. Under
+    // the per-item settler an attempt costs one claim on its own growing
+    // backoff, so the later tries arrive after any burst has ended.
     expect(MAX_PACKAGE_ATTEMPTS).toBeGreaterThanOrEqual(2);
-    // And not so many that a pinned upload waits an hour to advance.
-    expect(MAX_PACKAGE_ATTEMPTS).toBeLessThanOrEqual(3);
+    // Bounded, because "we keep trying" is not the alternative to retiring:
+    // the alternative is a property pinned on `source` with no picture at
+    // all — and a genuinely toxic document must still retire, as
+    // `operational`, never as evidence exhaustion.
+    expect(MAX_PACKAGE_ATTEMPTS).toBeLessThanOrEqual(6);
     expect(packageAttemptsExhausted(killedTick(null), question())).toBe(false);
   });
 });
 
 describe('a new question starts its own count', () => {
   it('a swapped package does not inherit the old one\'s failures', () => {
-    let stored: unknown = killedTick(null);
-    stored = recordPackageAttempt(stored, question());
+    let stored: unknown = null;
+    for (let kill = 0; kill < MAX_PACKAGE_ATTEMPTS; kill += 1) {
+      stored = recordPackageAttempt(stored, question());
+    }
     expect(packageAttemptsExhausted(stored, question())).toBe(true);
 
     // The builder swapped package A for package B: a different document, and
@@ -145,7 +158,7 @@ describe('the attempt shares a column with the verdict and cannot be mistaken fo
   });
 
   it('a real verdict is never counted as an attempt', () => {
-    const verdict = recordNoDeterministicImage(question(), 'that folder names no document');
+    const verdict = recordNoDeterministicImage(question(), 'that folder names no document', 'inspected');
     expect(attemptsSoFar(verdict, question())).toBe(0);
     expect(packageAttemptsExhausted(verdict, question())).toBe(false);
     // And it still stands as the answer it is.
@@ -158,7 +171,7 @@ describe('the attempt shares a column with the verdict and cannot be mistaken fo
     // whole design rests on.
     const attempt = killedTick(null);
     expect(attemptsSoFar(attempt, question())).toBe(1);
-    const settled = recordNoDeterministicImage(question(), 'read, names nothing');
+    const settled = recordNoDeterministicImage(question(), 'read, names nothing', 'inspected');
     expect(attemptsSoFar(settled, question())).toBe(0);
   });
 
@@ -245,23 +258,26 @@ describe('a returned step never resurrects the claim a kill left behind', () => 
     // Production rolled back to 1 here and looped for ever. It must not.
     expect(attemptsSoFar(stored, lot1342)).toBe(0);
 
-    // Tick 3 and 4 are two clean kills, which is what the guard counts.
-    stored = recordPackageAttempt(stored, lot1342);
-    stored = recordPackageAttempt(stored, lot1342);
+    // Then clean kills up to the budget, which is what the guard counts.
+    for (let kill = 0; kill < MAX_PACKAGE_ATTEMPTS; kill += 1) {
+      stored = recordPackageAttempt(stored, lot1342);
+    }
     expect(attemptsSoFar(stored, lot1342)).toBe(MAX_PACKAGE_ATTEMPTS);
     expect(packageAttemptsExhausted(stored, lot1342)).toBe(true);
   });
 
   it('never counts more kills than actually happened', () => {
-    // Two kills in a row must exhaust, and no undo ran between them.
-    let stored: unknown = recordPackageAttempt(null, lot1342);
-    expect(packageAttemptsExhausted(stored, lot1342)).toBe(false);
-    stored = recordPackageAttempt(stored, lot1342);
+    // Kills in a row, no undo between them: exhausted at the budget exactly.
+    let stored: unknown = null;
+    for (let kill = 0; kill < MAX_PACKAGE_ATTEMPTS; kill += 1) {
+      expect(packageAttemptsExhausted(stored, lot1342)).toBe(false);
+      stored = recordPackageAttempt(stored, lot1342);
+    }
     expect(packageAttemptsExhausted(stored, lot1342)).toBe(true);
   });
 
   it('gives back a real verdict untouched — only a claim is cleared', () => {
-    const verdict = recordNoDeterministicImage(lot1342, 'That folder names no document.');
+    const verdict = recordNoDeterministicImage(lot1342, 'That folder names no document.', 'inspected');
     expect(provenanceAfterAttempt(verdict, lot1342)).toBe(verdict);
     expect(provenanceAfterAttempt(null, lot1342)).toBeNull();
   });
@@ -284,5 +300,132 @@ describe('the settler undoes its claim through the pure rule', () => {
     expect(source).not.toContain(
       'source_provenance_result: negativeBefore.get(itemId) ?? null');
     expect(source).toContain('provenanceAfterAttempt(');
+  });
+});
+
+/**
+ * BUILDER STOCK — A LINK THAT CAN NEVER BE READ MUST NOT PIN A PROPERTY.
+ *
+ * PRODUCTION, 31 AUGUST 2026, upload `43ffa452`. After the branch-rotation fix
+ * thirteen properties were still claimed every sixty seconds, indefinitely,
+ * making no progress. Every one of their remaining branches answered
+ * `unreachable`, and `unreachable` records nothing on purpose:
+ *
+ *   1Tce_9IApKLACbWDP8FvEmdC2mC3RPD5j   HTTP 404  — Drive file gone
+ *   118vbAYRYMQi4L4sLYakT-nUdI6xysEiS   HTTP 404  — Drive file gone
+ *   1R9J70QzZqD5B7xupf-gIhM6gepQQNAVQ   "Google Drive: Sign-in"
+ *   1Pwauab0FRFVdPA7zP4tiRPpFli455977   4.2 MB single-page scan, no text layer
+ *
+ * Rotation gave each branch its turn and each turn answered the same nothing,
+ * so `openBranches` never emptied, the property never left the source stage,
+ * and it never reached the fallback ladder that would have given it a picture.
+ *
+ * "We keep trying" was not the alternative to retiring. The alternative was a
+ * property with no image at all, for ever.
+ */
+describe('a link that can be fetched and never read is retired, eventually', () => {
+  const unreadableTick = (stored: unknown) => recordUnreachableAttempt(stored, question());
+
+  it('counts an unreachable answer instead of forgetting it', () => {
+    let state: unknown = null;
+    expect(unreachableSoFar(state, question())).toBe(0);
+    state = unreadableTick(state);
+    expect(unreachableSoFar(state, question())).toBe(1);
+    state = unreadableTick(state);
+    expect(unreachableSoFar(state, question())).toBe(2);
+  });
+
+  it('retires the branch once the budget is spent, and not before', () => {
+    let state: unknown = null;
+    for (let tick = 1; tick <= MAX_UNREACHABLE_ATTEMPTS; tick += 1) {
+      expect(unreachableAttemptsExhausted(state, question())).toBe(false);
+      state = unreadableTick(state);
+    }
+    expect(unreachableAttemptsExhausted(state, question())).toBe(true);
+  });
+
+  it('gives an unreadable link more goes than a package that kills the worker', () => {
+    // A killed worker costs a whole invocation; an unreadable link costs one
+    // cheap fetch, and some of its failures are genuinely transient.
+    expect(MAX_UNREACHABLE_ATTEMPTS).toBeGreaterThan(MAX_PACKAGE_ATTEMPTS);
+  });
+
+  it('never pushes a package towards the resource-limit retirement', () => {
+    // The two findings are different and must not borrow each other's budget:
+    // an unreachable answer proves nothing about the worker's limits.
+    let state: unknown = recordPackageAttempt(null, question());
+    expect(attemptsSoFar(state, question())).toBe(1);
+    state = unreadableTick(state);
+    expect(attemptsSoFar(state, question())).toBe(0);
+    expect(packageAttemptsExhausted(state, question())).toBe(false);
+  });
+
+  it('a kill and an unreadable answer each still reach their own retirement', () => {
+    let killed: unknown = null;
+    for (let i = 0; i < MAX_PACKAGE_ATTEMPTS; i += 1) killed = recordPackageAttempt(killed, question());
+    expect(packageAttemptsExhausted(killed, question())).toBe(true);
+
+    let unread: unknown = null;
+    for (let i = 0; i < MAX_UNREACHABLE_ATTEMPTS; i += 1) unread = unreadableTick(unread);
+    expect(unreachableAttemptsExhausted(unread, question())).toBe(true);
+  });
+
+  it('the retirement is a verdict, and says the link could not be READ', () => {
+    const verdict = recordPackageUnreachable(question()) as unknown as Record<string, unknown>;
+    expect(verdict.result).toBe(NO_DETERMINISTIC_IMAGE);
+    // It must not claim the builder's document was empty, nor blame the
+    // worker's limits — an operator is told what actually happened.
+    expect(String(verdict.detail)).toMatch(/could not be read/i);
+    expect(String(verdict.detail)).not.toMatch(/resource limits/i);
+    expect(String(recordPackageUnprocessable(question()).detail)).toMatch(/resource limits/i);
+  });
+
+  it('the retirement settles the question, so the property advances', () => {
+    const state = { branches: { [question().packageReference]: recordPackageUnreachable(question()) } };
+    expect(negativeProvenanceStillStands(
+      state.branches[question().packageReference], question())).toBe(true);
+  });
+
+  it('a new question asks again from zero, so retiring is never for ever', () => {
+    let state: unknown = null;
+    for (let i = 0; i < MAX_UNREACHABLE_ATTEMPTS; i += 1) state = unreadableTick(state);
+    // A bumped extractor, a swapped package, or a re-imported row.
+    expect(unreachableSoFar(state, question({ provenanceVersion: PROVENANCE_VERSION + 1 }))).toBe(0);
+    expect(unreachableSoFar(state, question({ packageReference: 'https://drive.google.com/file/d/other/view' }))).toBe(0);
+    expect(unreachableSoFar(state, question({ sourceAnchor: 'notion:another-lot' }))).toBe(0);
+  });
+
+  it('an unreachable attempt is never mistaken for a verdict while it stands', () => {
+    const standing = unreadableTick(null);
+    expect(standing.result).toBe(PACKAGE_RECOVERY_ATTEMPT);
+    // `negativeProvenanceStillStands` is false for anything that is not the
+    // negative verdict, so an in-flight count reads as "ask again".
+    expect(negativeProvenanceStillStands(standing, question())).toBe(false);
+  });
+});
+
+describe('the settler banks an unreachable answer rather than discarding it', () => {
+  const source = () => readFileSync(
+    join(process.cwd(), 'supabase/functions/_shared/builderStock/repairSourceImages.ts'), 'utf8');
+
+  it('both unreachable exits go through the one bounded path', () => {
+    const body = source();
+    // The throw path and the returned-unreachable path.
+    expect(body).toContain('await bankUnreachable();');
+    expect((body.match(/await bankUnreachable\(\);/g) ?? []).length).toBe(2);
+    // And neither of them rolls the count back any more.
+    expect(body).not.toContain('await clearAttempt();\n      outcome.packageUnreachable');
+  });
+
+  it('it retires through the pure rule rather than a local copy', () => {
+    const body = source();
+    expect(body).toContain('unreachableAttemptsExhausted(branchBefore, question)');
+    expect(body).toContain('recordPackageUnreachable(question)');
+    expect(body).toContain('recordUnreachableAttempt(branchBefore, question)');
+  });
+
+  it('an unrecorded retirement is never settled on', () => {
+    const body = source();
+    expect(body).toContain('if (bankError) outcome.incomplete = true;');
   });
 });

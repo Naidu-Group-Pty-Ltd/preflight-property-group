@@ -79,6 +79,25 @@ export default defineConfig({
         find: /^https:\/\/esm\.sh\/unpdf@.+$/,
         replacement: path.resolve(__dirname, "./src/test/stubs/unpdf.ts"),
       },
+      // `djwt` is Deno-only and addressed by a `deno.land` URL, which neither
+      // the `npm:` nor the `esm.sh` rules below match. It arrives only as a
+      // transitive import — `clientAccess.ts` -> `authz.ts` -> `auth_v2.ts` ->
+      // `jwt.ts` — so a test of the client-access helpers (audit item 36)
+      // needs the chain to load without ever signing anything. The stub
+      // throws if it is actually used.
+      {
+        find: /^https:\/\/deno\.land\/x\/djwt@.+$/,
+        replacement: path.resolve(__dirname, "./src/test/stubs/djwt.ts"),
+      },
+      // `cloudflare:workers` is provided by the Workers runtime and by nothing
+      // else, so Vite cannot resolve it and collection dies for any test that
+      // reaches the Builder Stock PDF election Durable Object. The stub is a
+      // base class holding `ctx` and `env` and nothing more — the REAL object
+      // is what the tests then construct and drive.
+      {
+        find: /^cloudflare:workers$/,
+        replacement: path.resolve(__dirname, "./src/test/stubs/cloudflareWorkers.ts"),
+      },
       { find: /^https:\/\/esm\.sh\/(@[^/]+\/[^@]+)@[^/]+$/, replacement: "$1" },
       { find: /^https:\/\/esm\.sh\/([^@/][^@]*)@[^/]+$/, replacement: "$1" },
     ],

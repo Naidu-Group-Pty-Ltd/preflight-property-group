@@ -106,10 +106,22 @@ describe('a spreadsheet says "points somewhere" in more than one way', () => {
   });
 
   it('the reader asks the one module that knows, rather than reading `l` itself', () => {
+    /*
+     * The reader moved out of `fetchSource.ts` into its own module when the
+     * hyperlink recovery needed the same one — the import and the recovery
+     * must not each carry a copy that could disagree about a builder's
+     * brochure. The rule this pins is unchanged: the target is asked of
+     * `hyperlinkTargetOf`, which reads the formula as well as the relationship.
+     */
     const source = readFileSync(
-      'supabase/functions/_shared/builderStock/fetchSource.ts', 'utf8');
+      'supabase/functions/_shared/builderStock/workbookSheets.ts', 'utf8');
     expect(source).toContain('hyperlinkTargetOf({');
     expect(source).toContain('formula: cell?.f ?? null');
+    // And `fetchSource` reads it from there rather than re-implementing it.
+    const fetcher = readFileSync(
+      'supabase/functions/_shared/builderStock/fetchSource.ts', 'utf8');
+    expect(fetcher).toContain("from './workbookSheets.ts'");
+    expect(fetcher).not.toContain('cell?.l?.Target');
   });
 });
 
@@ -189,10 +201,16 @@ describe('17/18 — inaccessible is not the same as absent', () => {
       const message = sourceAccessNoticeFor(unread)!.message;
       expect(seen.has(message)).toBe(false);
       seen.add(message);
-      // All three obligatory statements, on every one of them.
+      // All three obligatory statements, on every one of them: what could
+      // not be reached, that the rows imported anyway, and what happens to
+      // the affected pictures — they WAIT, rather than being substituted.
+      // (The third used to promise processing was "continuing with the other
+      // sources", which described the old fall-through-to-web policy; the
+      // fallback gate now holds those cards, and the sentence says so.)
       expect(message).toMatch(/could not be accessed/i);
       expect(message).toMatch(/imported successfully/i);
-      expect(message).toMatch(/continuing/i);
+      expect(message).toMatch(/until the links can be read/i);
+      expect(message).toMatch(/substitute image is never used/i);
     }
   });
 

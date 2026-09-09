@@ -49,6 +49,7 @@ function itemAt(id: string, stage = 'source'): ClaimedItem {
   return {
     id, organisation_id: ORG, upload_id: 'upload-1',
     image_work_stage: stage, image_work_attempts: 0, lifecycle_status: 'active',
+    pending_upload_id: null,
   };
 }
 
@@ -341,16 +342,33 @@ describe('a claimed property is worked ALONE', () => {
 
 describe('the package attempt stays the package\'s own', () => {
   it('is not touched by the orchestration', () => {
-    // MAX_PACKAGE_ATTEMPTS = 2 remains authoritative, is written before the
-    // download begins, and lives in `source_provenance_result`. Nothing in the
-    // per-item machinery may become a second opinion about it.
+    /*
+     * MAX_PACKAGE_ATTEMPTS = 2 remains authoritative, is written before the
+     * download begins, and lives in `source_provenance_result`. Nothing in the
+     * per-item machinery may become a second opinion about it.
+     *
+     * WHAT CHANGED, AND WHY THE RULE DID NOT. The stage machine now READS that
+     * column, because the fallback gate has to know whether the builder's own
+     * sources are finished with before it routes a property to the external
+     * ladder. Reading is not a second opinion; WRITING is, and so is owning
+     * the counter. So the rule is pinned as it was always meant: the settler
+     * may not name the budget, may not import the attempt module, and may not
+     * write the column. `readSuppliedEvidence` is the one interpreter and it
+     * is a pure function both this and `settleFallbackImages` call.
+     */
     const stageMachine = readFileSync(join(REPO_ROOT,
       'supabase/functions/_shared/builderStock/settleItemImages.ts'), 'utf8');
     const code = stageMachine.replace(/\/\*[\s\S]*?\*\//g, ' ')
       .split('\n').map((line) => line.replace(/\/\/.*$/, '')).join('\n');
     expect(code).not.toContain('MAX_PACKAGE_ATTEMPTS');
-    expect(code).not.toContain('source_provenance_result');
     expect(code).not.toContain('packageAttempt');
+    // No write, in any of the shapes a write takes.
+    expect(code).not.toMatch(/source_provenance_result\s*:/);
+    expect(code).not.toMatch(/\.update\([^)]*source_provenance_result/);
+    // And the reading it does make goes through the one shared row reader —
+    // the same function the enforcement in `settleFallbackImages` calls, so
+    // routing and enforcement cannot disagree about a property.
+    expect(code).toContain('readStoredRowEvidence');
   });
 
   it('gives one property the whole tick, which is what lets a package be attempted at all', () => {
@@ -580,3 +598,63 @@ describe('nothing about an image is decided here', () => {
     }
   });
 });
+
+/**
+ * BUILDER STOCK — AN EMPTY ITEM QUEUE IS WHEN THE UPLOAD MARKERS ARE OWED.
+ *
+ * PRODUCTION, 30 AUGUST - 1 SEPTEMBER 2026. Upload `a0f8dfe4` (`export.csv`,
+ * 26 properties) settled every one of its items and then sat at
+ * `status = 'enriching'` for thirty-six hours with all three upload markers
+ * NULL — `source_images_settled_version`,
+ * `marketplace_eligibility_settled_version`,
+ * `image_sanitization_settled_version`.
+ *
+ * The per-item queue replaced the upload walk for finding and judging
+ * pictures, but never took over stamping those markers: only
+ * `settleUploadSourceImages` writes them, and it is reached only through the
+ * sweep that sits BELOW the deployment-skew branch. With the claim function
+ * deployed, that branch is unreachable — measured, 4,438 settler invocations
+ * in twenty-four hours, every one an item tick, NOT ONE a settlement tick and
+ * not one reporting skew.
+ *
+ * `builder_stock_uploads` therefore never stopped counting as outstanding, so
+ * `settle_builder_stock_marketplace_eligibility_tick` could never satisfy its
+ * own retirement condition and the cron fired once a minute for ever against
+ * an empty queue.
+ */
+describe('a drained per-item queue continues to the upload-level sweep', () => {
+  it('returns early only while item work is still outstanding', () => {
+    // Nothing due but something still leased or backing off is the case the
+    // early return exists for, and it keeps it.
+    expect(SETTLER).toMatch(/if \(pending\.outstanding > 0\) \{/);
+  });
+
+  it('falls through when the queue is genuinely empty', () => {
+    expect(SETTLER).toMatch(/itemQueueDrained = true;/);
+    // And the sweep that stamps the markers is what it falls through to.
+    const afterDrain = SETTLER.slice(SETTLER.indexOf('itemQueueDrained = true;'));
+    expect(afterDrain).toMatch(/runSettlementTick\(/);
+    expect(afterDrain).toMatch(/settleUploadSourceImages\(/);
+  });
+
+  it('does not cry deployment skew when the queue is merely empty', () => {
+    // The warning names an unapplied migration and a remedy. Emitting it on a
+    // healthy deployment every minute would make a real skew unfindable.
+    expect(SETTLER).toMatch(/if \(!itemQueueDrained\) \{\s*console\.warn/);
+  });
+
+  it('still reports skew when the claim function really is missing', () => {
+    // Unchanged: `available: false` sets nothing, so the warning still fires.
+    const skew = SETTLER.slice(SETTLER.indexOf('DEPLOYMENT SKEW'));
+    expect(skew).toMatch(/deployment_skew/);
+    expect(skew).toMatch(/20261019000000_builder_stock_item_work_claim\.sql/);
+  });
+
+  it('reaches the sweep under the SAME lease, so two ticks cannot overlap', () => {
+    const drainAt = SETTLER.indexOf('itemQueueDrained = true;');
+    const leaseAt = SETTLER.indexOf("claim_builder_stock_settlement_lease");
+    expect(drainAt).toBeGreaterThan(-1);
+    expect(leaseAt).toBeGreaterThan(drainAt);
+  });
+});
+

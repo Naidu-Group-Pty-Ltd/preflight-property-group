@@ -415,6 +415,72 @@ describe('recovering a row-linked package image', () => {
     expect(outcome.status).toBe('unreachable');
   });
 
+  /**
+   * PRODUCTION, 31 AUGUST 2026, upload `43ffa452`.
+   *
+   * The row's `Siting  / Masterplan` column links a bare image — Lot 117's is a
+   * 169 KB JPEG, Lot 607's a 29 KB WebP, both answering HTTP 200. Because the
+   * only test applied to the bytes was "does it start %PDF-", both were called
+   * "not publicly downloadable": an `unreachable`, which records no verdict, so
+   * the branch was re-opened and re-asked on every tick and the two branches
+   * behind it were never reached once in ten attempts. Forty-nine properties
+   * sat on `source` with `progressed: false`.
+   *
+   * A link that downloads is not a link that needs a sign-in. It is read, it is
+   * answered, and the answer is banked.
+   */
+  it('answers a direct link to an image, rather than calling it unreachable', async () => {
+    const jpeg = new Uint8Array(64);
+    jpeg.set([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01]);
+    const outcome = await recoverPackageImage(
+      {
+        packageUrl: 'https://drive.google.com/file/d/1HCZ5YS2Q5JyGwF09_WySBPCtme3fsnjd/view',
+        label: LOT_43_LABEL,
+      },
+      { fetchPackage: async (url: string) => ({ bytes: jpeg, finalUrl: url }) },
+    );
+    // A finding, so it is written down and the property moves on to its next
+    // branch — never `unreachable`, which is what re-asked it for ever.
+    expect(outcome.status).toBe('not_identified');
+  });
+
+  it('does not take a directly linked image as the property\'s own photograph', async () => {
+    const png = new Uint8Array(64);
+    png.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]);
+    const outcome = await recoverPackageImage(
+      {
+        packageUrl: 'https://drive.google.com/file/d/1l93VIaycKn-5lAryKtUy1hnHL6Yt_6R3/view',
+        label: LOT_43_LABEL,
+      },
+      { fetchPackage: async (url: string) => ({ bytes: png, finalUrl: url }) },
+    );
+    /*
+     * `recovered_photograph` is licensed by a FOLDER named for the lot. A file
+     * a row points at establishes nothing about which property it is of — one
+     * live folder is shared by forty-four rows — so promoting it would be
+     * attribution by row position wearing another name.
+     */
+    expect(outcome.status).not.toBe('recovered_photograph');
+    expect(outcome.status).not.toBe('recovered');
+  });
+
+  it('still reports a sign-in page as unreachable, not as a finding', async () => {
+    const outcome = await recoverPackageImage(
+      {
+        packageUrl: 'https://drive.google.com/file/d/1PQfyfbscQnJPUouTK85fnnAYeMceFvop/view',
+        label: LOT_43_LABEL,
+      },
+      {
+        fetchPackage: async (url: string) => ({
+          bytes: new TextEncoder().encode('<html><body>Request access</body></html>'),
+          finalUrl: url,
+        }),
+      },
+    );
+    // Nothing was learned, so nothing may be banked: it may open tomorrow.
+    expect(outcome.status).toBe('unreachable');
+  });
+
   it('will not follow a package link off Drive', async () => {
     let called = false;
     const outcome = await recoverPackageImage(
@@ -620,5 +686,93 @@ describe('a package whose text layer cannot be read', () => {
     );
 
     expect(outcome.status).toBe('not_identified');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A DOCUMENT ON AN ORDINARY HOST
+// ---------------------------------------------------------------------------
+
+describe('a brochure linked from a shared-link host', () => {
+  /*
+   * PRODUCTION, 1 SEPTEMBER 2026. All thirteen brochures on the live stock
+   * list are Dropbox shared links, and every one was refused "That package is
+   * not on a source we can read" before anything was fetched — then banked as
+   * a finished negative, so thirteen properties whose builder filed a correct
+   * brochure were told their package named no image. The same links serve the
+   * actual PDF once asked for the file (`dl=1`) rather than the viewer.
+   */
+  const DROPBOX_PDF =
+    'https://www.dropbox.com/scl/fi/psnrldf00mgfijwdu9skk/Lot-709-Verve.pdf?rlkey=a36ud46bamzjr&dl=0';
+  const LOT_709_LABEL = 'Lot 709, Clyde VIC 3978 [Verve]';
+  const render = jpegBytes(160_000, 0x55);
+
+  it('fetches the FILE address and reads it exactly as a Drive direct link', async () => {
+    const requested: string[] = [];
+    const outcome = await recoverPackageImage(
+      { packageUrl: DROPBOX_PDF, label: LOT_709_LABEL },
+      {
+        fetchPackage: async (url: string) => {
+          requested.push(url);
+          return { bytes: packagePdf(render, jpegBytes(240_000, 0x66)), finalUrl: url };
+        },
+        readPageTexts: coverTextFor(LOT_709_LABEL),
+      },
+    );
+
+    expect(outcome.status).toBe('recovered');
+    if (outcome.status !== 'recovered') return;
+    // The reference names the builder's own file, so the picture can be found
+    // again — and the fetch asked for the file, not the preview application.
+    expect(outcome.image.documentName).toBe('Lot-709-Verve.pdf');
+    expect(outcome.image.reference).toBe('Lot-709-Verve.pdf#page1:Im0');
+    expect(requested).toHaveLength(1);
+    expect(new URL(requested[0]).searchParams.get('dl')).toBe('1');
+    // Only a query parameter moved: same scheme, same host, same path.
+    expect(new URL(requested[0]).hostname).toBe('www.dropbox.com');
+    expect(new URL(requested[0]).pathname)
+      .toBe('/scl/fi/psnrldf00mgfijwdu9skk/Lot-709-Verve.pdf');
+  });
+
+  it('holds the document to the direct-link standard: it must state its property', async () => {
+    const outcome = await recoverPackageImage(
+      { packageUrl: DROPBOX_PDF, label: LOT_709_LABEL },
+      {
+        fetchPackage: async (url: string) =>
+          ({ bytes: packagePdf(render, jpegBytes(240_000, 0x66)), finalUrl: url }),
+        // A different lot's cover: the row pointed at it, but pointing is not
+        // naming, so nothing may be taken out of it.
+        readPageTexts: coverTextFor('Lot 999, Elsewhere Estate [Bishop 258]'),
+      },
+    );
+    expect(outcome.status).toBe('not_identified');
+  });
+
+  it('reports the viewer page as unreachable, never as a finding', async () => {
+    // What the host serves when the file parameter is ignored or the share is
+    // gone: an HTML application. Nothing was learned about the document.
+    const outcome = await recoverPackageImage(
+      { packageUrl: DROPBOX_PDF, label: LOT_709_LABEL },
+      {
+        fetchPackage: async (url: string) => ({
+          bytes: new TextEncoder().encode('<!DOCTYPE html><html><body>Dropbox</body></html>'),
+          finalUrl: url,
+        }),
+      },
+    );
+    expect(outcome.status).toBe('unreachable');
+  });
+
+  it('still refuses an ordinary link that names no document', async () => {
+    // The standing rule survives: a page, a portal, a folder on a host with no
+    // listing this pipeline can parse is not a source we can read — and that
+    // stays a finding, reached without a fetch.
+    let called = false;
+    const outcome = await recoverPackageImage(
+      { packageUrl: 'https://packages.example/lot-43', label: LOT_43_LABEL },
+      { fetchPackage: async () => { called = true; throw new Error('must not fetch'); } },
+    );
+    expect(outcome.status).toBe('not_identified');
+    expect(called).toBe(false);
   });
 });
