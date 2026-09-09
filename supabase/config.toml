@@ -109,15 +109,18 @@ verify_jwt = true
 
 [functions.compare-investment-reports]
 verify_jwt = true
-request_timeout = 120
+request_timeout = 180
 
 [functions.compare-cash-flow-reports]
 verify_jwt = true
-request_timeout = 120
+request_timeout = 180
 
 [functions.generate-portfolio-analysis]
 verify_jwt = true
-request_timeout = 120
+# A fourteen-section analysis took 78s of model time at a 8,000-token budget,
+# and that budget was the reason every answer arrived truncated. A larger one
+# is a longer call, so the wall clock moves with it. `report-qa` sits at 300.
+request_timeout = 240
 
 [functions.calculate-borrowing-capacity]
 verify_jwt = true
@@ -263,6 +266,45 @@ verify_jwt = false
 request_timeout = 1500
 
 [functions.abs-data-service]
+verify_jwt = false
+
+# The crime reference-data ingest: same internal-secret / per-state
+# sealed-bootstrap auth as abs-poa-ingest (see the function header).
+[functions.crime-data-ingest]
+verify_jwt = true
+
+# The GTFS transport ingest: internal-secret / sealed-bootstrap auth in the
+# function, gateway JWT in front of it, exactly as the other ingests.
+[functions.transport-gtfs-ingest]
+verify_jwt = true
+
+# The ABS reference-data ingest: internal-secret / sealed-bootstrap auth
+# inside; the gateway JWT stays on in front of it.
+[functions.abs-poa-ingest]
+verify_jwt = true
+
+# The RBA statistical-tables ingest: CSV text arrives in the POST body
+# (rba.gov.au refuses this project's egress), parsed server-side; internal
+# secret via X-Cron-Secret / per-table sealed-bootstrap auth inside, the
+# gateway JWT on in front.
+[functions.rba-tables-ingest]
+verify_jwt = true
+
+# The ABS regional-population ingest: fetches the release datacube itself
+# (abs.gov.au answers this project's egress); internal secret /
+# sealed-bootstrap auth inside, the gateway JWT on in front.
+[functions.abs-regional-ingest]
+verify_jwt = true
+
+# The per-section index over stored reports: derives an addressable projection
+# of investment_reports.report_content and writes only the two derived tables.
+# Internal secret (bearer or X-Cron-Secret) or the per-report self-sealing
+# bootstrap arm inside; the gateway JWT stays on in front of it.
+[functions.report-sections-index]
+verify_jwt = true
+
+# Public-class locality service (parseJsonBody-bounded), like its siblings.
+[functions.abs-regional-service]
 verify_jwt = false
 
 [functions.rba-data-service]
@@ -624,6 +666,15 @@ verify_jwt = false
 [functions.resolve-listing-coordinates]
 verify_jwt = false
 
+# ME-5 item 15. Maintains `report_geography` for reports the backfill did not
+# cover. It holds the service-role key and performs NO auth check of its own,
+# so the gateway is the only thing between an anonymous caller and a sweep that
+# spends the ABS geoserver's rate limit on somebody else's behalf. `true` is
+# therefore the declaration, not the default nobody chose — a service-role key
+# is itself a valid JWT, so a scheduled invocation still reaches it.
+[functions.resolve-report-geography]
+verify_jwt = true
+
 [functions.street-view]
 verify_jwt = false
 
@@ -834,6 +885,16 @@ verify_jwt = false
 verify_jwt = false
 
 [functions.mission-control-balance]
+verify_jwt = false
+
+# The activation gate. `verify_jwt = false` for the same reason as its
+# siblings: the function verifies the session itself with `verifyAuth`, which
+# accepts this app's own HttpOnly cookie as well as a Supabase JWT, and the
+# platform gate would reject the cookie-only case before the handler runs.
+# Declared explicitly because an OMITTED block is read as `true` — see
+# docs/security/VERIFY_JWT.md, where that default was wrong for 91 of 425
+# functions.
+[functions.mission-control-gate]
 verify_jwt = false
 
 # Both verify the session themselves via `verifyAuth`, exactly as
@@ -1178,6 +1239,13 @@ verify_jwt = false
 [functions.builder-portal-stock]
 verify_jwt = false
 
+# Authenticated by a per-request one-time capability token presented as a
+# bearer, not by a Supabase JWT: the caller is a Make scenario with no Supabase
+# identity. Declared explicitly because an omitted block reads as `true`, which
+# would assert a gateway check that is not what guards this function.
+[functions.builder-stock-link-callback]
+verify_jwt = false
+
 # Internal callers only, through the signed envelope (`verifyInternal`). The
 # gateway must NOT be asked for a Supabase JWT: pg_cron signs its own envelope
 # and carries no user session.
@@ -1504,6 +1572,12 @@ verify_jwt = false
 [functions.phase6-quality-ops]
 verify_jwt = false
 
+# Zoning/parcel/development readings from state planning services; called
+# internally by the generator with the internal edge secret (verifyAuth
+# inside), like the other location data services.
+[functions.planning-data-service]
+verify_jwt = false
+
 [functions.portal-upload-file]
 verify_jwt = false
 
@@ -1554,3 +1628,9 @@ verify_jwt = false
 
 [functions.template-import-finalize-worker]
 verify_jwt = false
+
+[functions.market-source-probe]
+# Read-only diagnostic. Guarded by the gateway AND by its own verifyAuth: it
+# reports which market-data credential NAMES are set (never a value) and probes
+# a fixed allow-list of source URLs. It writes nothing.
+verify_jwt = true
