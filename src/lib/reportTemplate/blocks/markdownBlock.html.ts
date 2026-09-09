@@ -5,8 +5,11 @@ import {
 } from './_shared.html';
 import { renderMarkdown } from '../../../../supabase/functions/_shared/reports/markdown.pure';
 import {
-  packMarkdownPages, DEFAULT_LINES_PER_PAGE,
+  packMarkdownPages, packNarrativePages, resolveNarrativeProfile, DEFAULT_LINES_PER_PAGE,
 } from '../../../../supabase/functions/_shared/reports/markdownPaging.pure';
+import { stripBakedCover } from '../../../../supabase/functions/_shared/reports/investment/narrativeClean.pure';
+import { vizDirectiveRenderer } from '../../../../supabase/functions/_shared/reports/vizFigures.pure';
+import { CHART_TARGET_WIDTH_MM, type ChartContext } from '../../../../supabase/functions/_shared/reportDesign/charts.pure';
 
 export { packMarkdownPages, DEFAULT_LINES_PER_PAGE };
 
@@ -94,8 +97,74 @@ export function renderMarkdownBlockHtml(block: Block, ctx: HtmlBlockContext): st
   const headingColor = resolveBindableColor(p.headingColor ?? 'token:primary', ctx, '#BF9B50');
   const ruleColor = resolveBindableColor(p.ruleColor ?? 'token:border', ctx, '#E4E4E7');
 
-  const result = renderMarkdown(String(source));
-  const pages = packMarkdownPages(result.blocks, linesPerPage);
+  // The calibrated narrative profile, resolved EXACTLY as the projection
+  // resolves it (`resolveNarrativeProfile` is the single authority), so the
+  // page count a master's conditionals read and the buckets this block draws
+  // are the same arithmetic. The profile also carries the baked-cover strip:
+  // the projection publishes the stripped source, but a master bound straight
+  // at raw content must not disagree with one bound at `narrative.source`.
+  const reportType = String((ctx.data as Record<string, any> | undefined)?.report?.type ?? '');
+  const profile = resolveNarrativeProfile(reportType);
+  const cleanSource = profile ? stripBakedCover(String(source)).text : String(source);
+
+  /**
+   * The chart directives the generator's prompt demands, drawn in the
+   * template's own palette.
+   *
+   * This call passed no `renderDirective`, and `renderMarkdown` treats a
+   * shortcode as an instruction either way — so every directive in a templated
+   * body was REMOVED and drawn as nothing. Measured on a real Compass render
+   * (1/27D Mitchell Street, 2026-09-04): the stored body carries 43 directives
+   * — 13 glance strips, 6 bars, 6 donuts, 6 gauges, 4 timelines, a wheel, tiles,
+   * a heatmap, a pictograph — and the PDF contained none of them; the
+   * Disclaimer, whose whole content is one glance strip, printed as a heading
+   * over nothing.
+   *
+   * `widthMm` is deliberately left at the renderer's own default
+   * (`CHART_TARGET_WIDTH_MM`) rather than derived from this block's box: the
+   * projection charges the SAME directives through `planningChartContext()`,
+   * whose width is that same default, and `figureLines` reads geometry alone —
+   * so the two sides charge identical line counts whatever palette each draws
+   * with. A width computed from the box here would put the page count and the
+   * buckets on different arithmetic, which is the drift this file exists to
+   * prevent.
+   */
+  // CSS keywords as fallbacks, the `planningChartContext` convention: every
+  // family master defines these tokens, so a keyword only paints where a
+  // template is missing its palette — and a keyword is visibly not a palette
+  // decision, which also keeps the hex-literal ratchet honest.
+  const tok = (name: string, fallback: string) =>
+    resolveBindableColor(`token:${name}`, ctx, fallback);
+  const accent = tok('primary', 'darkgoldenrod');
+  const ink = tok('ink', 'black');
+  const muted = tok('muted', 'grey');
+  const positive = tok('positive', 'seagreen');
+  const caution = tok('caution', 'darkgoldenrod');
+  const negative = tok('negative', 'firebrick');
+  const chartCtx: ChartContext = {
+    widthMm: CHART_TARGET_WIDTH_MM,
+    palette: {
+      ground: tok('surface', 'white'),
+      groundAlt: tok('panel', 'gainsboro'),
+      rule: tok('line', 'silver'),
+      ink,
+      inkMuted: muted,
+      accent,
+      accentDeep: tok('accentInk', accent),
+      positive,
+      caution,
+      negative,
+      informative: tok('info', accent),
+      series: [accent, tok('accentInk', accent), muted, positive, caution, negative],
+    },
+  };
+  const result = renderMarkdown(cleanSource, {
+    charging: profile?.charging,
+    renderDirective: vizDirectiveRenderer(chartCtx),
+  });
+  const pages = profile
+    ? packNarrativePages(result.blocks, profile, linesPerPage)
+    : packMarkdownPages(result.blocks, linesPerPage);
   const page = pages[pageIndex];
   if (!page || !page.length) return '';
 
