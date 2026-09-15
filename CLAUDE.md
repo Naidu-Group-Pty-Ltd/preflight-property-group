@@ -197,14 +197,33 @@ a caller naming rows and a caller asking questions.
 
 **And there are two `NPC Emails` bases.** `apptyShYE0yzL4IGB` is live and
 growing; `appFNPL7iYiuQyHAO` is a rebuild of it in a DIFFERENT Airtable account,
-copied on 2026-08-18, whose 148 records all carry that one timestamp and which
-has taken nothing since — the cutover was never completed, and both
+copied on 2026-08-18 — the cutover was never completed, and both
 `REBUILT_BASE.md` and `MAKE_CUTOVER.md` read as though it had been. Two things
 follow: **re-pointing anything at the rebuild replaces a growing marketplace
-with a frozen one** (171 of the prime's cached listings were created after the
-copy), and **a perfectly valid token can be refused across the boundary** —
-a personal access token reaches only its own account's bases, so the first
-question on a 401 is which account minted it, not whether the token is good.
+with a nearly empty one**, and **a perfectly valid token can be refused across
+the boundary** — a personal access token reaches only its own account's bases,
+so the first question on a 401 is which account minted it, not whether the token
+is good.
+
+Read [`BASE_BACKFILL.md`](./docs/listings/BASE_BACKFILL.md) before running
+`npm run listings:backfill-intake`, activating a re-pointed intake scenario, or
+changing which base the product reads. The rebuild's 148 migrated rows were
+empty shells and were deleted on 2026-09-15; it holds 2 real listings against
+the live base's 171. The reason that blocks a cutover is not just that the
+rebuild is thin — **`listings_cache` DELETES a cached row that vanished from the
+source while still inside the retention window**, so re-pointing the sync at a
+base without today's listings presents all 171 as vanished at once. The 10%
+destructive cap archives rather than part-deletes a batch that large, so it is
+recoverable, but the marketplace empties with nothing reporting it. Three rules
+bite. **Only what the product reads travels** — the include set is parsed from
+`airtableIntakeFields.pure.ts` at runtime rather than copied, and the full column
+set is 3.3 MB against 385 KB for the product-read plus provenance set, 76% of the
+difference being `Email Body Plain Text` alone. **A copied row cannot carry its
+own creation date** — `Created Time` is a `CREATED_TIME()` formula in the
+rebuild, so provenance travels in `Email Received At` and `First Seen At`
+instead, and attachments do not travel at all because an Airtable attachment URL
+expires within hours. And **every written record is stamped in `Internal Notes`**,
+which is what makes the copy idempotent, resumable and undoable in one command.
 
 That card used to alias its `AIRTABLE_API_KEY` field onto `AIRTABLE_TOKEN` and
 write it into the project environment through the Management API — so a key
@@ -1465,6 +1484,88 @@ contradict. Placement is load-bearing: **after** the series heal (the ROI
 denominator is the stored deposit) and **before** the upfront total (which is
 the deposit plus the acquisition lines).
 
+## The Investment Grade — Scoring V2 in production
+Read the *Activation* section of
+[`docs/reports/SCORING_V2_METHODOLOGY.md`](./docs/reports/SCORING_V2_METHODOLOGY.md)
+before touching `_shared/reports/market/scoringV2Production.pure.ts`,
+`investment-scoring-service`, `domain-data-service` or the market-evidence
+block in `generate-investment-report`. Every new report read *"Grade withheld
+— no scoring system is currently authorised"* from 11 to 15 Sep 2026 for two
+stacked reasons: no engine was authorised (V1 is not trusted to grade, V2 was
+frozen unwired), and there was nothing to measure — `domain-data-service`
+had requested a deprecated `/v1` route without the postcode segment and had
+**never once succeeded**, so Growth and Demand were absent on every report.
+`SCORING_V2_ACTIVATION` (ME-8, 15 Sep 2026) is the decision, a constant and
+never configuration; `scoreForProduction` projects the engine's canonical
+output onto the record every reader already understands, under a stamp whose
+`authority` is `v2`.
+
+Four rules bite. **The legacy service never imports the engine** — it reaches
+V2 through the activation module alone and still cannot spell `v2`
+(`LegacyScoringAuthority`), and the pin spec asserts exactly one entrypoint,
+one path. **Growth is required before a letter is printed**: three dimensions
+can be measured without it, and the delivered-points ceiling then caps the
+grade at a B that is a statement about missing data — so the grade is withheld
+and `gradeGaps` names each unmeasured dimension, the provider's refusal (the
+`X-Domain-Security-Reason` where Domain sent one) and the remedy, and the card
+and the page draw the same list. **Evidence is keyed on the trusted geography
+only** — the suburb, state and postal area resolved from the verified
+coordinate, never the typed suburb or the parsed four-digit token, the same
+rule the crime evidence answers to — so an unresolved geography seeks nothing
+and says so. And **Domain's licensing is `unverified` until the rights
+follow-up is answered**: the engine scores on the points and the client-facing
+evidence statement withholds their provenance; declaring it licensed is a
+decision with a document behind it, not a default.
+
+**The Domain 403 is a portal setting, not a mystery.** Re-measured from the
+production egress on 15 Sep 2026: the key is set and recognised, and both
+Domain products answer 403 with Domain's own body *"Operation not permitted on
+project"* — the project the key belongs to has **no API package attached**,
+which Domain's access conventions name as the one condition under which no
+endpoint answers. The remedy is the Domain Developer Portal (Projects → API
+Access → add **Properties & Locations** → Save), recorded step by step in
+`docs/integrations/DOMAIN_ACTIVATION_REQUEST.md`; nothing in this repository
+can attach it. `describeDomainRefusal` reads Domain's problem-details `detail`
+and names that finding on the grade gap, so a report withheld for it says
+where the fix is rather than "a restriction Domain must identify".
+
+## The 291 Stone Mason Drive audit (QA-291SM)
+Read [`docs/reports/QA_291SM_REMEDIATION_TRACKER.md`](./docs/reports/QA_291SM_REMEDIATION_TRACKER.md)
+before touching the standard (pdf-lib) presentation, the fork's section
+routing, the condense guides, the financial engine's loan arithmetic or the
+cash-flow seeding: it records forty findings against six real documents and
+what each turned out to be. Four rules from it keep biting. **A figure a
+document prints is a figure the record holds** — the Briefing invented an
+"overall fit 68/100" nothing held (`scoreClaims.pure.ts` removes the sentence
+and the validator reports the class), and the renderer's override injection
+matched `Interest Rate.*?NN%` and rewrote every sensitivity label with the
+base rate, so every injection now matches an explicit `Label: NN%` and
+nothing else. **What a section may hold is read from its body, not its
+heading** (`forkSectionContracts.pure.ts`): the risk register is split by
+what each entry is about, a SEIFA heading needs an index, a checklist is
+named as one. **A promise of a figure is a figure** — a directive the
+standard presentation cannot draw is tabulated (`vizDirectiveTables.pure.ts`),
+never dropped behind the sentence that introduced it, and the word-cap cut
+works in whole blocks so a bullet cannot lose its explanation or a pair of
+lists its second half. And **one loan ledger** (`loanLedger.pure.ts`) drives
+projections, metrics and sensitivities, so "interest only" is never projected
+with P&I arithmetic. The render service's 503 — and the 500 it became that
+afternoon — is a separate matter:
+[`RENDER_SERVICE_AVAILABILITY.md`](./docs/reports/RENDER_SERVICE_AVAILABILITY.md).
+Two rules from that day. **The host's error page is not the engine's answer**:
+Cloud Run's front door serves the same HTML under 500 as under 503 and both
+mean no instance took the request — measured with a `GET /` that needs no
+token and no engine — so `classifyServiceAnswer` reads the SHAPE of the
+answer rather than its digit, and a chosen template the engine did not draw
+is drawn by the in-tab renderer instead (`browserStandInFor`), marked, said
+out loud, never remembered as the finalisation, and never on a refusal. And
+**a fork mints no grade** (`variantScorePolicy.pure.ts`): the Financial fork
+wrote D · 39 · CAUTION beside a Compass whose run had withheld the grade under
+the scoring policy, and the Generated Reports card showed that D as the
+property's grade — the child restates the parent's decision, a variant score
+never stands for the property while a composite exists, and the literal `N/A`
+the scoring service stores is a placeholder no surface draws.
+
 ## Generated reports / PDFs
 **Read [`docs/reports/COVERAGE.md`](./docs/reports/COVERAGE.md) before anything
 else here.** The design system renders **0.14%** of the documents this product
@@ -1490,6 +1591,26 @@ became activatable and unresolvable); a chosen template whose engine is not
 would have picked and it produces the legacy document either way; and a
 selection that goes stale resolves to **`unavailable`**, never silently to a
 different template.
+
+**A chosen template that cannot carry the report is composed, never shipped
+empty.** Read the last section of
+[`docs/reports/TEMPLATE_SELECTION.md`](./docs/reports/TEMPLATE_SELECTION.md)
+before touching `templateBindingCoverage.pure.ts`, `templateComposition.pure.ts`
+or the composition step in `routeReportThroughTemplate`. The library's
+First-Home Buyer Report was chosen for an Investment report and drew five
+near-empty pages as a `succeeded` render: it binds a sample-preset vocabulary
+(`client.deposit`, `grants.fhog`, `steps.0`) no adapter publishes, and the two
+existing guards catch a static copy and an empty context, not the wrong
+vocabulary. Coverage is now measured **against the data the adapter built**,
+never a sample, and the rule is narrow on purpose: a template is composed only
+when it binds content and **none** of it resolves — its cover, closing and
+static pages kept, its blank pages left out, the body drawn from a donor that
+carries the report under the chosen template's tokens. A template that binds
+nothing is a brochure and one that resolves a single field is the author's
+document; both are drawn as designed. The ranking is not a safe donor on its
+own (`resolve_report_template` ranks a person's own templates first, so the
+template that cannot carry the report is often the ranking's pick), which is
+why the donor search reads the published set.
 
 **A document can be completely correct and still never reach the renderer.**
 Read [`docs/reports/RENDER_BOUNDARY.md`](./docs/reports/RENDER_BOUNDARY.md)
@@ -1544,6 +1665,11 @@ against a ~150s edge ceiling. It survives by stopping at a wall-clock budget and
 being resumed — by the browser, the bulk worker, or a cron watchdog. Read
 [`docs/reports/INVESTMENT_REPORT_RESUME.md`](./docs/reports/INVESTMENT_REPORT_RESUME.md)
 before changing the section loop, its timeouts, or anything that claims a report.
+**A model call takes the window the run can spare, never a constant**: the
+closing section measured 40-110s against a fixed 60s timeout, so it timed out on
+every run and 43 invocations were killed with nothing written; every call now
+answers to the run's own deadline, and a section with no window left is
+deferred as a hand-off rather than written up as a failed section.
 
 Ten formats have been migrated onto it, and each carries its own contract:
 [`INVESTMENT.md`](./docs/reports/INVESTMENT.md),
@@ -1739,6 +1865,75 @@ engine reads attributes on SVG text, not `style`** — `font-size="6.5"` sets
 five `:::` fences the generator's prompt asks for (pull quote, sidenote, stat,
 divider, quote page) are DRAWN by `renderMarkdown` now — they printed raw on
 every structure — with an unknown kind unwrapped rather than printed.
+
+**Market Intelligence and Report Q&A are on the geometry too, and their
+omission notes are folded, not paged.** Read §7 of the same doc before
+touching `geometryAwareFormat`, `planNarrative`'s pages-path reader,
+`NARRATIVE_NOTES_KEY` or `PackOptions.reserveLines`. Neither format had a
+profile, so their runs packed at 34 estimated lines against a ~46-line box:
+measured on the Chancery renders, MI continuation pages were 20–40% full
+while the same layers were clipped by up to 14 pages and 4 of 41 pages
+carried only the "This section continues" callout; the Q&A answer was cut at
+8 of an estimated 26 pages with half-empty pages before the cut. Four rules.
+**A format joins the geometry by being measured**, and only where the
+renderer files one — a block on its own packs as before and no projection
+estimate changes. **The pages path is read off the continuation conditional**
+(`marketIntel.layers[0].pages > n`, `qa.answerPages > n`), never assumed, and
+the copy that writes the true count keeps an array an array. **A note the
+master gave a page of its own is folded onto the last allowed page**, its
+counts rewritten to the renderer's truth, the room held back by the packer so
+nothing overflows. And **a numbered step keeps its bulleted sub-points and its
+number**: a nested run of the other kind belongs to the item above it (nesting
+by rank of indentation), and a resumed ordinal is written as
+`counter-reset: list-item` because WeasyPrint 69.0 ignores `<ol start>` —
+`styleTags` merges a tag's own style rather than writing a second attribute
+the parser drops.
+
+**A placeholder never reaches a client document — the owner's rule is "N/A or
+unavailable, never".** Read §8 of
+[`RUNTIME_CONSOLIDATION.md`](./docs/reports/RUNTIME_CONSOLIDATION.md) before
+touching `presentStoredMarkdown`, the ungraded branch of
+`reportBindingProjection`, the scorecard rows, `UNSTATED_CONFIDENCE` or any
+generator prompt that mentions a missing figure. Every Executive Briefing in
+production carried 36–97 "N/A" cells and rendered them verbatim, because
+`stripPlaceholderRows` ran on the WRITE path alone and every stored row
+predated it — so the same scrub now runs where stored content is READ, at the
+four readers, by one imported implementation, byte-identical on a clean
+document. Three rules bite. **An absence is omitted, never worded**: an
+ungraded record publishes no verdict at all (the headline used to read "Not
+available — insufficient verified evidence"), an unscored dimension draws no
+row ("Not assessed" beside a dash), and a chip with nothing to state is not
+drawn. **A prompt never asks for a placeholder, an estimate or a confession** —
+the governed authority's recovery sentence says what the analysis rests on,
+never what it lacks, and the generator hands the model only the dimensions
+that scored. And **prose is never regex-scrubbed**, on read or on write:
+`neverAPlaceholder.spec.ts` scans structure and source, not sentences.
+
+**One finalisation is one PDF, on every format — and every exit points at
+it.** Read §9 of [`RUNTIME_CONSOLIDATION.md`](./docs/reports/RUNTIME_CONSOLIDATION.md)
+before touching a `deliver*` module, `publishReportToPortal`, the Cash Flow
+modal's send path or `deliverMarketIntelligencePdf`. Every one of the nine
+non-Investment formats already drew its own document with the pinned
+WeasyPrint engine, and four things were off the pattern, each invisible from
+the outside: a chosen template was drawn by the browser's jsPDF on all nine
+(`routeReportThroughTemplate` defaults to `renderer: 'browser'` and only the
+Investment delivery named the final one, so choosing a template DOWNGRADED the
+document); Cash Flow's "Send to Client" shipped a jsPDF with its own chart
+switches while "Generate PDF" shipped the typeset one; the two on-publish
+portal renders fetched the route's bytes back and uploaded a second copy, so
+the ledger named one object and the portal another; and Market Intelligence
+entered its template path only when `persist` was off, on a button that
+defaults it on. Four rules. **A delivery names the final renderer**
+(`finalRendererOnEveryFormat.spec.ts` scans for it and forbids it anywhere
+else). **Where the bytes already are is part of the answer** — every blob
+helper returns `storagePath`, the three routes return `path`, and a publish
+points rather than copies; an upload survives only for a document nothing
+stored. **A moved override is a different document**: the Cash Flow send
+reuses a produced document only while `cashFlowFinalKey` (series, scenario,
+template choice) still matches. And **a switch the document cannot honour is
+removed, never left dead** — the send dialog's chart toggles reached only
+jsPDF and are gone, while the export menu's own switches still govern the
+legacy download, which stays a named choice.
 
 `INVESTMENT.md` is the one to read before touching anything the *model* draws. Its prose carries a chart vocabulary the generator's
 prompt demands and the renderer had never parsed: **3,753 `{{bars: ...}}`-style
