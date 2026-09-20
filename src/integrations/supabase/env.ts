@@ -15,18 +15,33 @@
  * built-in pair and says so loudly, because silently mixing them produces
  * 401s that look like an auth bug rather than a configuration one.
  *
- * ── Why the prime's values are still the fallback ────────────────────────────
+ * ── Why the fallback is THIS deployment, and not the prime ───────────────────
  *
- * So that this change is a no-op upstream. A build with no Supabase variables
- * set behaves exactly as it did when the values were inlined; only a build
- * that sets them moves. That is what makes it safe to land in the internal
- * console and the client-facing deployment at the same time.
+ * It used to be the prime's pair, under a heading reading "Why the prime's
+ * values are still the fallback" and the reason "so that this change is a
+ * no-op upstream". That reasoning is sound in the repository it was written
+ * in — the prime's own — where the prime's project IS this deployment's. It
+ * came here verbatim with the mirror, and the sentence stayed true-looking
+ * while becoming false.
+ *
+ * What it meant here is that a build which does not set VITE_SUPABASE_URL
+ * does not fail, or warn, or degrade: it silently serves ANOTHER TENANT'S
+ * PRODUCTION DATABASE from this deployment's domain. A missing variable is
+ * the ordinary state of a new deployment, so that is the failure mode rather
+ * than the safety net — `npc-client-dashboard` reached production that way.
+ *
+ * A fallback that reaches somewhere is only safe when the somewhere is us.
+ *
+ * Both halves move together, because the PAIR is what authenticates: the anon
+ * key's `ref` claim names the project it belongs to, and a URL from one
+ * project with a key from another authenticates to nothing.
+ * `shippedBackendIdentity.spec.ts` asserts the pair names this project.
  */
 
-/** The project this repository has always shipped against. */
-const FALLBACK_URL = 'https://dduzbchuswwbefdunfct.supabase.co';
+/** This deployment's own project. Never another's — see above. */
+const FALLBACK_URL = 'https://egrmsulhtmqnmhvuccxr.supabase.co';
 const FALLBACK_ANON_KEY =
-  'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRkdXpiY2h1c3d3YmVmZHVuZmN0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTU0NDM4NzksImV4cCI6MjA3MTAxOTg3OX0.eSYU6fxIc3tBQuGLsdBRff0alBMkNfvv7OpW0efNjxk';
+  'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVncm1zdWxodG1xbm1odnVjY3hyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODgxNTM1MDQsImV4cCI6MjEwMzcyOTUwNH0.QwnqVuvV1lwVMHicP3P7u_D0ydkz-HE_5bv_emqlMWo';
 
 function readEnv(key: string): string | undefined {
   try {
