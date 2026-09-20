@@ -129,3 +129,36 @@ describe('shipped files name this deployment and nothing else', () => {
     expect(new Set([...urlRefs, ...keyRefs])).toEqual(new Set([OWN_PROJECT_REF]));
   });
 });
+
+describe('the built-in fallback pair is this deployment too', () => {
+  // `public/` is what a browser fetches; `env.ts` is what the app itself
+  // talks to when nothing configured it. A build that does not set
+  // VITE_SUPABASE_URL is the ordinary state of a new deployment, so the
+  // fallback is reached routinely rather than exceptionally — and for as long
+  // as it named the prime, reaching it meant serving another tenant's
+  // production database from this deployment's domain, silently.
+  const env = read(join('src', 'integrations', 'supabase', 'env.ts'));
+
+  it('FALLBACK_URL names this project', () => {
+    const url = /const FALLBACK_URL = '([^']+)'/.exec(env)?.[1] ?? '';
+    expect(url, 'FALLBACK_URL not found').not.toBe('');
+    expect(url).toBe(`https://${OWN_PROJECT_REF}.supabase.co`);
+  });
+
+  it('FALLBACK_ANON_KEY belongs to this project', () => {
+    // The pair is what authenticates. A URL from one project with a key from
+    // another authenticates to nothing, so both halves are checked and they
+    // are checked against the same answer.
+    const key = /const FALLBACK_ANON_KEY =\s*'([^']+)'/.exec(env)?.[1] ?? '';
+    expect(key, 'FALLBACK_ANON_KEY not found').not.toBe('');
+    expect(jwtRefsIn(key), 'the fallback key is unreadable').not.toEqual([]);
+    expect(jwtRefsIn(key)).toEqual([OWN_PROJECT_REF]);
+  });
+
+  it('the resolver names no other project at all', () => {
+    const foreign = new Set<string>();
+    for (const [, ref] of env.matchAll(URL_REF)) if (ref !== OWN_PROJECT_REF) foreign.add(ref);
+    for (const ref of jwtRefsIn(env)) if (ref !== OWN_PROJECT_REF) foreign.add(ref);
+    expect([...foreign], `env.ts names foreign projects: ${[...foreign].join(', ')}`).toEqual([]);
+  });
+});
