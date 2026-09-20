@@ -38,7 +38,7 @@
  * the identical file and each one checks itself.
  */
 import { describe, expect, it } from 'vitest';
-import { readFileSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
 const REPO_ROOT = join(__dirname, '..', '..', '..');
@@ -131,16 +131,39 @@ describe('shipped files name this deployment and nothing else', () => {
 });
 
 describe('the built-in fallback pair is this deployment too', () => {
-  // `public/` is what a browser fetches; `env.ts` is what the app itself
+  // `public/` is what a browser fetches; the fallback is what the app itself
   // talks to when nothing configured it. A build that does not set
   // VITE_SUPABASE_URL is the ordinary state of a new deployment, so the
   // fallback is reached routinely rather than exceptionally — and for as long
   // as it named the prime, reaching it meant serving another tenant's
   // production database from this deployment's domain, silently.
-  const env = read(join('src', 'integrations', 'supabase', 'env.ts'));
+  //
+  // WHERE the pair is declared is deliberately discovered rather than assumed.
+  // It lived in `env.ts` until the reads were split out into
+  // `supabaseTarget.pure.ts`, and a spec that named one file would have gone
+  // green on the other by finding nothing — the failure mode this whole file
+  // exists to close. Both layouts are searched; if neither declares the pair,
+  // that is a failure and not a pass.
+  const CANDIDATES = [
+    join('src', 'integrations', 'supabase', 'supabaseTarget.pure.ts'),
+    join('src', 'integrations', 'supabase', 'env.ts'),
+  ];
+
+  const present = CANDIDATES.filter((rel) => existsSync(join(REPO_ROOT, rel)));
+  const sources = present.map((rel) => ({ rel, text: read(rel) }));
+
+  const declaring = sources.find((s) => /FALLBACK_URL\s*=\s*'/.test(s.text));
+
+  it('some module in this repository declares the fallback pair', () => {
+    // Asserted before the two below, so "nobody declares it" reads as itself
+    // rather than as a URL that failed to match.
+    expect(present, 'neither candidate module exists').not.toEqual([]);
+    expect(declaring?.rel, `no module declares FALLBACK_URL: tried ${CANDIDATES.join(', ')}`)
+      .toBeDefined();
+  });
 
   it('FALLBACK_URL names this project', () => {
-    const url = /const FALLBACK_URL = '([^']+)'/.exec(env)?.[1] ?? '';
+    const url = /FALLBACK_URL\s*=\s*'([^']+)'/.exec(declaring?.text ?? '')?.[1] ?? '';
     expect(url, 'FALLBACK_URL not found').not.toBe('');
     expect(url).toBe(`https://${OWN_PROJECT_REF}.supabase.co`);
   });
@@ -149,16 +172,22 @@ describe('the built-in fallback pair is this deployment too', () => {
     // The pair is what authenticates. A URL from one project with a key from
     // another authenticates to nothing, so both halves are checked and they
     // are checked against the same answer.
-    const key = /const FALLBACK_ANON_KEY =\s*'([^']+)'/.exec(env)?.[1] ?? '';
+    const key = /FALLBACK_ANON_KEY\s*=\s*'([^']+)'/.exec(declaring?.text ?? '')?.[1] ?? '';
     expect(key, 'FALLBACK_ANON_KEY not found').not.toBe('');
     expect(jwtRefsIn(key), 'the fallback key is unreadable').not.toEqual([]);
     expect(jwtRefsIn(key)).toEqual([OWN_PROJECT_REF]);
   });
 
-  it('the resolver names no other project at all', () => {
-    const foreign = new Set<string>();
-    for (const [, ref] of env.matchAll(URL_REF)) if (ref !== OWN_PROJECT_REF) foreign.add(ref);
-    for (const ref of jwtRefsIn(env)) if (ref !== OWN_PROJECT_REF) foreign.add(ref);
-    expect([...foreign], `env.ts names foreign projects: ${[...foreign].join(', ')}`).toEqual([]);
+  it('no module on the resolver path names any other project', () => {
+    const offenders: string[] = [];
+    for (const { rel, text } of sources) {
+      for (const [, ref] of text.matchAll(URL_REF)) {
+        if (ref !== OWN_PROJECT_REF) offenders.push(`${rel} -> ${ref}`);
+      }
+      for (const ref of jwtRefsIn(text)) {
+        if (ref !== OWN_PROJECT_REF) offenders.push(`${rel} -> key for ${ref}`);
+      }
+    }
+    expect(offenders, `resolver modules naming foreign projects: ${offenders.join(', ')}`).toEqual([]);
   });
 });
