@@ -115,8 +115,19 @@
 
   <script>
     (function () {
-      var SUPABASE_URL = 'https://dduzbchuswwbefdunfct.supabase.co';
-      var ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRkdXpiY2h1c3d3YmVmZHVuZmN0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTU0NDM4NzksImV4cCI6MjA3MTAxOTg3OX0.eSYU6fxIc3tBQuGLsdBRff0alBMkNfvv7OpW0efNjxk';
+      // THIS deployment's own project, never another's. A standalone embed
+      // cannot read `VITE_*`, so the pair is written out here — and it is the
+      // PAIR, because the anon key's `ref` claim names the project it belongs
+      // to and a URL from one project with a key from another authenticates to
+      // nothing.
+      //
+      // It was the prime's, which meant every lead this form captured went into
+      // the prime's database from this deployment's own domain. A cascade then
+      // nearly replaced that with a SIBLING deployment's pair, which is why the
+      // guard in `src/lib/__tests__/shippedBackendIdentity.spec.ts` asks whether
+      // a ref is OURS rather than whether it is the prime's.
+      var SUPABASE_URL = 'https://egrmsulhtmqnmhvuccxr.supabase.co';
+      var ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVncm1zdWxodG1xbm1odnVjY3hyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODgxNTM1MDQsImV4cCI6MjEwMzcyOTUwNH0.QwnqVuvV1lwVMHicP3P7u_D0ydkz-HE_5bv_emqlMWo';
 
       var params = new URLSearchParams(window.location.search);
       var slug = params.get('slug');
