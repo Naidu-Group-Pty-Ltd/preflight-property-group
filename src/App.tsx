@@ -17,7 +17,7 @@ import { PaymentGateProvider } from "@/hooks/usePaymentGate";
 import { ProtectedRoute } from "@/components/auth/ProtectedRoute";
 
 import { ModuleGuard } from "@/components/auth/ModuleGuard";
-import { InternalToolingGuard } from '@/components/auth/InternalToolingGuard';
+import { NotOnThisDeployment } from "@/components/auth/ClientFacingGate";
 import { DashboardLayout } from "./components/layout/DashboardLayout";
 import { BackgroundJobTracker } from "./components/BackgroundJobTracker";
 import { ReportGenerationProgress } from "./components/reports/ReportGenerationProgress";
@@ -27,8 +27,8 @@ import { TokenEventsListener } from "@/components/billing/TokenEventsListener";
 import { PricingMockBanner } from "@/components/billing/PricingMockBanner";
 import { PushNotificationPrompt } from "./components/PushNotificationPrompt";
 import { ErrorBoundary } from "@/components/common/ErrorBoundary";
-import { PublicLinkErrorFallback } from "@/components/portal/PublicLinkErrorFallback";
 import { DashboardErrorFallback } from "@/components/layout/DashboardErrorFallback";
+import { PublicLinkErrorFallback } from "@/components/portal/PublicLinkErrorFallback";
 import { lazyWithRetry } from "@/lib/lazyWithRetry";
 import { HarveyCountdown } from "@/components/HarveyCountdown";
 import { Button } from "@/components/ui/button";
@@ -48,10 +48,15 @@ const Settings = lazyWithRetry(() => import("./pages/Settings"));
 const UserGuide = lazyWithRetry(() => import("./pages/UserGuide"));
 const Feedback = lazyWithRetry(() => import("./pages/Feedback"));
 const Support = lazyWithRetry(() => import("./pages/Support"));
-import DataImport from './pages/DataImport';
-import Monitoring from './pages/Monitoring';
-import QualityAssurance from './pages/QualityAssurance';
-import ErrorLogs from './pages/ErrorLogs';
+// Lazy like every other route. These four were static imports, which put
+// their whole module graph in the entry chunk — shipped to, and downloaded
+// by, every visitor on first paint even though all four are operator tools
+// this deployment hides. Nothing else changes: lazyWithRetry is what the
+// rest of the routes already use, and Suspense is already above them.
+const DataImport = lazyWithRetry(() => import('./pages/DataImport'));
+const Monitoring = lazyWithRetry(() => import('./pages/Monitoring'));
+const QualityAssurance = lazyWithRetry(() => import('./pages/QualityAssurance'));
+const ErrorLogs = lazyWithRetry(() => import('./pages/ErrorLogs'));
 import Automation from './pages/Automation';
 import EmailCopilot from './pages/EmailCopilot';
 import CallLogs from './pages/CallLogs';
@@ -105,8 +110,7 @@ const AmlPassports = lazyWithRetry(() => import("./pages/aml/AmlPassports"));
 import {
   AmlVerification, AmlScreening, AmlRisk, AmlCounterparty,
   AmlFinance, AmlTransactions,
-  AmlMonitoring, AmlInvestigations, AmlAustracReporting, AmlAustracReportDraft,
-  AmlRecords, AmlGovernance, AmlConfiguration,
+  AmlMonitoring, AmlInvestigations, AmlAustracReporting, AmlAustracReportDraft, AmlRecords, AmlGovernance, AmlConfiguration,
 } from "./pages/aml/AmlShellPages";
 const AmlLaunchOps = lazyWithRetry(() => import("./pages/aml/AmlLaunchOps"));
 const AmlPartnerOperations = lazyWithRetry(() => import("./pages/aml/AmlPartnerOperations"));
@@ -120,15 +124,53 @@ const SharedMarketQAAnswer = lazyWithRetry(() => import("./pages/qa/SharedMarket
 const MarketQASubscriptions = lazyWithRetry(() => import("./pages/qa/MarketQASubscriptions"));
 const MarketQADigests = lazyWithRetry(() => import("./pages/qa/MarketQADigests"));
 
-const Integrations = lazyWithRetry(() => import("./pages/Integrations"));
-const WorkflowPlayground = lazyWithRetry(() => import("./pages/WorkflowPlayground"));
+/**
+ * A route whose MODULE must not exist in a client-facing build.
+ *
+ * Hiding a route stops it being reached; it does not stop its chunk being
+ * built and served. These five carry the deployment's vendor and
+ * infrastructure vocabulary — the 143-entry integration registry with its
+ * Supabase secret names, the workflow vendor catalog, the model roster, the
+ * Cloudflare surface and the API-usage/billing internals — so for them the
+ * chunk itself is the leak.
+ *
+ * Each `__EXCLUDE_*__` is a build-time literal, so Rollup folds the ternary
+ * and drops the `import()` behind it: no chunk is emitted at all. They are one
+ * constant per page rather than one flag for all five because
+ * `VITE_CLIENT_FACING_ALLOW` can keep a named page on a deployment that hides
+ * the rest, and a single flag cannot express that — vite.config.ts derives each
+ * from the same allowance list the navigation and the route gate read.
+ *
+ * The placeholder renders the gate's OWN screen rather than `null`. It used to
+ * be `() => null` on the reasoning that ClientFacingGate answers these paths
+ * before the element does; the reasoning was sound and the premise was false.
+ * `isClientFacingDeployment()` read `import.meta.env` through a cast that
+ * Vite's substitution never matched, so on every client-facing build the gate
+ * believed it was the internal console and waved the URL through to an element
+ * with nothing behind it: `/integrations` drew a blank content area — no
+ * title, no cards, no explanation — which reads as a broken page rather than a
+ * withheld one. The flag is repaired (src/lib/clientFacing.ts), and the
+ * placeholder no longer depends on its being right.
+ */
+const RouteExcludedFromBuild = () => <NotOnThisDeployment />;
+
+const Integrations = __EXCLUDE_INTEGRATIONS__
+  ? RouteExcludedFromBuild
+  : lazyWithRetry(() => import("./pages/Integrations"));
+const WorkflowPlayground = __EXCLUDE_WORKFLOW_PLAYGROUND__
+  ? RouteExcludedFromBuild
+  : lazyWithRetry(() => import("./pages/WorkflowPlayground"));
 const MarketingAnalytics = lazyWithRetry(() => import("./pages/MarketingAnalytics"));
-const CloudflareManagement = lazyWithRetry(() => import("./pages/CloudflareManagement"));
+const CloudflareManagement = __EXCLUDE_CLOUDFLARE__
+  ? RouteExcludedFromBuild
+  : lazyWithRetry(() => import("./pages/CloudflareManagement"));
 const ClientManagement = lazyWithRetry(() => import("./pages/ClientManagement"));
 const ClientTracker = lazyWithRetry(() => import("./pages/ClientTracker"));
 const PortfolioReports = lazyWithRetry(() => import("./pages/PortfolioReports"));
 const ReportRequests = lazyWithRetry(() => import("./pages/ReportRequests"));
-const ApiUsage = lazyWithRetry(() => import("./pages/ApiUsage"));
+const ApiUsage = __EXCLUDE_API_USAGE__
+  ? RouteExcludedFromBuild
+  : lazyWithRetry(() => import("./pages/ApiUsage"));
 const DealPipeline = lazyWithRetry(() => import("./pages/DealPipeline"));
 const RemindersHub = lazyWithRetry(() => import("./pages/RemindersHub"));
 const Checklists = lazyWithRetry(() => import("./pages/Checklists"));
@@ -145,7 +187,9 @@ const PublicPassport = lazyWithRetry(() => import("./pages/PublicPassport"));
 const GamePlan = lazyWithRetry(() => import("./pages/GamePlan"));
 const Commissions = lazyWithRetry(() => import("./pages/Commissions"));
 const ReportsAnalytics = lazyWithRetry(() => import("./pages/ReportsAnalytics"));
-const ModelHub = lazyWithRetry(() => import("./pages/ModelHub"));
+const ModelHub = __EXCLUDE_MODEL_HUB__
+  ? RouteExcludedFromBuild
+  : lazyWithRetry(() => import("./pages/ModelHub"));
 const Billing = lazyWithRetry(() => import("./pages/Billing"));
 const TokenAuditLog = lazyWithRetry(() => import("./pages/TokenAuditLog"));
 const CommercialIndustrial = lazyWithRetry(() => import("./pages/commercial/CommercialIndustrial"));
@@ -378,7 +422,16 @@ const App = () => (
                             recipient has no account and no support channel, so
                             the application's generic "Something went wrong"
                             reads to them as a broken link and leaves them with
-                            no step; this one names the re-send. */}
+                            no step; this one names the re-send.
+
+                            Brought across by hand from the prime. `src/App.tsx`
+                            is `manual_reconcile` in this clone's sync
+                            exclusions — it carries RouteExcludedFromBuild and
+                            the __EXCLUDE_*__ gates the prime does not — so a
+                            new upstream route arrives here only when somebody
+                            adds it. These two are public links a recipient
+                            opens; they are not developer surfaces, so they are
+                            not gated. */}
                         <Route
                           path="/partner-acknowledgement/:token"
                           element={(
@@ -671,6 +724,13 @@ const App = () => (
                     back button. Both sit UNDER `austrac`, which is what keeps
                     them in the Regulatory & Assurance workspace —
                     `pathMatchesWorkspace` matches a prefix followed by `/`.
+
+                    Brought across by hand: `src/App.tsx` is held
+                    `manual_reconcile` by the cascade because this clone carries
+                    route gates the prime does not, so an upstream route never
+                    arrives on its own. The cascade delivered the page and the
+                    source test that asserts these two lines; only the lines
+                    themselves had to be written here.
                   */}
                   <Route path="austrac/new" element={<AmlGuard capability="aml.report"><AmlAustracReportDraft /></AmlGuard>} />
                   <Route path="austrac/:reportId/edit" element={<AmlGuard capability="aml.report"><AmlAustracReportDraft /></AmlGuard>} />
@@ -690,7 +750,7 @@ const App = () => (
                 <Route path="qa/digests" element={<MarketQADigests />} />
 
                 <Route path="integrations" element={<ModuleGuard moduleKey="integrations"><Integrations /></ModuleGuard>} />
-                <Route path="integrations/ghl-migration" element={<InternalToolingGuard><GhlMigration /></InternalToolingGuard>} />
+                <Route path="integrations/ghl-migration" element={<GhlMigration />} />
                 <Route path="workflow-playground" element={<ModuleGuard moduleKey="integrations"><WorkflowPlayground /></ModuleGuard>} />
                 <Route path="cloudflare" element={<ModuleGuard moduleKey="cloudflare"><CloudflareManagement /></ModuleGuard>} />
                 <Route path="api-usage" element={<ModuleGuard moduleKey="api_usage"><ApiUsage /></ModuleGuard>} />
