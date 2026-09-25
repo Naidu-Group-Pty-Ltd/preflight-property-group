@@ -2126,8 +2126,8 @@ area's general character is not a retrieval either). **An evidence note
 describes the RETRIEVAL, never the conclusion beside it.** And **the two
 absences are different sentences**: `none_at_point` is a register asked here
 that holds nothing here, the other four are ways of never having asked, so
-`RegisterReading` carries the distinction and the page prints "Searched,
-nothing found." or "Not searched." The same gap existed one level down —
+`RegisterReading` carries the distinction and the page prints "Checked —
+nothing recorded." or "Not covered by this report." The same gap existed one level down —
 `planningFactBlocks` rule 4 closed the STATEMENT ("never write that no overlay
 applies") and the model obeyed it, then rated `Environmental nuisance | Low`
 from the same absence one row later. Three things had to be CHECKED rather than
@@ -2902,6 +2902,120 @@ chapter it is evidence for**, so the recommendation stays the last assessment.
 **A comparison with one side left is not drawn, and neither is its caption.**
 And **our words never reach the page as labels** — a registry id or a phrase of
 the prompt is described to the model and scrubbed on read.
+
+## A report speaks as the adviser, and makes one recommendation
+Read [`ADVISER_VOICE.md`](./docs/reports/ADVISER_VOICE.md) before touching
+`_shared/reports/adviserVoice.pure.ts`, `printedVerdict.pure.ts`,
+`recommendationContract`, `readerNote`, the register headings in
+`registerTables.pure.ts`, or any sentence a composer hands the writer or the
+page. The regenerated Lawley Compass said "register" 110 times, "retrieved"
+38, "this platform" 11 and "Not searched." six times — every sentence true,
+none of them about the property — and printed **STRONG BUY** on its cover
+beside **"Proceed with caution"** in its verdict. Two causes. **The words were
+ours**: the verbatim blocks, the section purposes and even the contract's
+worked example of an *honest* sentence spoke the machine room's vocabulary,
+and a writer copies what it is handed. **The repetition was an instruction**: a
+"say that" rule pinned into every section call is obeyed in every section, so
+one absence was explained five times. Four rules bite. **The machine room
+never reaches the page** — `PLATFORM_VOCABULARY` is narrow on purpose (a
+relocatable home is "loaded onto a truck", Queensland has "coordinated
+projects"), because a warning that fires on ordinary English teaches an
+operator to ignore it; and `adviserVoice.spec.ts` reads the string literals of
+every composer, because a fixture reaches only the branches it was written
+for. **A limitation is explained once, in the section that owns its subject**
+(`DISCLOSURE_HOMES`, `inHomeSection`, `elsewhereOnly`); a prohibition still
+binds every section, since it costs no words. **The two absences are one pair
+of constants** (`REGISTER_CHECKED_EMPTY`, `REGISTER_NOT_COVERED`), because two
+spellings of one distinction on two pages read as two meanings, and a service
+note is translated on the way OUT (`readerNote`) rather than rewritten at the
+source, which reaches cached answers too. And **the document makes one
+recommendation**: both verdict sections open with the label the cover prints.
+Prose is never scrubbed — `platform-vocabulary` is a QA warning. One thing the
+rewrite found is worth knowing before renaming anything: **a header row is a
+KEY** — `REGISTER_TABLE_HEADERS` dedupes a reproduced register by its whole
+header row, so both spellings are listed and a spec reads every header the
+composers draw (the corrector's `PERMITTED_ABSENCE_RE` was the same key and
+went stale the same way). **The four derived documents follow the route they
+are made by**: the fork (Financial Analysis, Due Diligence) makes no model call
+and copies its parent's prose, so its composed chapters are held to the same
+literal scan and a stale Compass is regenerated before it is derived; the
+condenser (Briefing, Snapshot) rewrites, and `documentRules` gives its tiers
+nothing, so its system message carries `condensedVoiceRules()` and
+`condensedRecommendationContract()` — appended AFTER the template, which the
+database can override.
+
+## A report carries the property's own photographs, and never the wrong ones
+Read [`PROPERTY_PHOTOGRAPHS.md`](./docs/reports/PROPERTY_PHOTOGRAPHS.md) before
+touching `_shared/reportPhotographs.pure.ts`,
+`_shared/listingPagePhotographs.pure.ts`, the `photographs` option on
+`get-investment-reports`, the `capture_report` op on `listing-images`,
+`urlExtractPhotographs.ts`, `adapters/reportPhotographs.ts` or a
+`property.images` binding.
+
+**Hero Image Studio's placements never reached the document a client
+receives.** Only the standard presentation reads them, it draws them on a
+figures page after the body, and only with a switch that is off by default.
+Five Compass masters were built to bind `property.images.N` (Atelier, Atelier
+Plate and Grand Folio on the cover; plates in those three, Frontispiece and
+Elevation). Nothing filled that binding, while the image library held every
+listing-sourced report's photographs. The Investment adapter fills it now,
+through the report broker, and inlines each photograph as a `data:` URI,
+because the renderer may fetch nothing.
+
+Three rules bite:
+
+- **A report filters where a gallery demotes.** Every photo slot is designed
+  to print nothing when empty, so a missing photograph costs nothing, while
+  the wrong one puts somebody else's house on a client's cover. A report takes
+  only what the server has seen to be a photograph, never one another listing
+  also holds, and nothing at all when the reuse reading fails.
+- **A photograph never costs the document.** Every failure drops that one
+  photograph.
+- **A cover takes the photograph only where nothing moves** (seed v21,
+  `withCoverPhotograph`, §7 of the same doc):
+  - The 16 field covers take it behind the whole sheet.
+  - The 18 banded covers take it inside the band. The title grows upward by
+    as many lines as the address needs, so no photograph goes between them.
+  - The 11 paper covers are left as drawn: dark type on a photograph is a
+    different cover, and Monograph is photo-free by design.
+
+  The photograph sits under **two** passes of the field colour's scrim, where
+  the photographic covers use one: over a white facade one pass leaves these
+  covers' small type at 3.48:1, below the 7:1 print floor, and two passes give
+  7.89:1. Without a photograph each cover draws exactly what it drew before,
+  and nothing fills the space. It is composed in code; the Claude Design
+  catalogue does not draw it.
+
+**A URL-extract report carries the listing's own photographs** (the owner's
+decision, 25 Sep 2026; §6 of the same doc). The extraction names them: on
+realestate.com.au, the gallery in the page's own data, attributed by the
+listing id so the "similar properties" beside it are never taken. Anywhere
+else it names nothing: a page's `og:image` is what the page wants shared, not
+a statement of which property a picture shows, and was removed as a fallback.
+The report asks `listing-images` to keep them under the report, never in
+`listing_images`.
+
+**And every photograph is of the report's own address and property, on both
+paths** (the owner's rule; rule 4 in §3): never a picture chosen to fill a
+slot. `photographsAreOfReportAddress` holds the report's address as it reads
+NOW against the address the photographs belong to: the listing's composed
+address, or the address the extraction read, recorded in `capture.json`. The
+comparison is `isSameProperty`, and anything it cannot verify takes nothing.
+
+Three more rules bite. **The browser's
+minute is not the deadline**: the server writes down what was asked
+(`capture.json`, beside the photographs), answers, and does the work after
+answering, and a capture the host left unfinished is finished by the next
+document drawn, which waits at most 45 s and never fails for it. **Only the
+author starts a capture; anyone who may read the report may finish one**, and
+a finish continues exactly what the record says. **A photograph's name carries
+its place in the listing's gallery**, and a capture is not final while a place
+ahead of the sixth kept one is undecided, so a lead photograph whose host
+failed the first time still becomes the cover.
+
+The resale section also draws the published price history
+(`priceHistoryChart`, §6 of `MARKET_FIGURES_IN_THE_REPORT.md`): the latest
+quarter of each of ten years, from the record, or nothing.
 
 ## A premium document, and the eighteen per cent that was bold
 
@@ -3878,6 +3992,11 @@ whose conditional is false left a third of a page white between a heading and
 the recommendation under it; `closeDroppedBlocks` moves the column under a
 dropped block up to where it began, refuses whenever anything drawn sits in
 that band or beside the column, and never moves furniture or an editor page.
+**A dropped layer is not a hole**: a block whose declared box reaches past the
+block below it was drawn under that block (a photograph beneath a cover's
+type), and closing it lifted the three photographic covers with no photograph
+to the page's top edge — measured over all 543 templates, that rule changes
+those three covers and nothing else.
 And **a chart label fits the drawing it belongs to** — `fitLines` wraps a
 label into the units it may use and the drawing grows for the lines, because
 a gauge caption, a donut legend, a timeline stop and a pictograph title were
