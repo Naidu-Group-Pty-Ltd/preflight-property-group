@@ -102,6 +102,21 @@ describe('F-02 — the operator backfills require a JWT', () => {
     // functions with their config blocks (436 before). The count is a ratchet
     // against a function slipping in undeclared; check-verify-jwt-declared.mjs
     // enforces the rule itself.
+    // Reconciled by the cascade. This deployment declares 28 edge function(s) the prime
+    // does not — backfill-opportunity-mappings, ghl-account-preview,
+    // ghl-legacy-backfill-gaps, ghl-legacy-wipe-orchestrator, ghl-legacy-wipe-worker,
+    // ghl-marketing-dump-enqueue, ghl-marketing-dump-export, ghl-marketing-dump-worker,
+    // ghl-marketing-raw-dump, ghl-migrate-bookings-worker,
+    // ghl-migrate-calendar-groups-worker, ghl-migrate-calendars-worker,
+    // ghl-migrate-contacts-worker, ghl-migrate-conversations-replay-worker,
+    // ghl-migrate-conversations-reset-phantoms, ghl-migrate-conversations-worker,
+    // ghl-migrate-notes-worker, ghl-migrate-opportunities-worker,
+    // ghl-migrate-workflow-enrollments-worker, ghl-migrate-workflow-reenroll-worker,
+    // ghl-migrate-workflows-snapshot-worker, ghl-test-credentials,
+    // ghl-workflow-visualizer, migration-dispatcher, migration-job-control,
+    // migration-job-status, migration-orchestrator, migration-upload-source — so the
+    // prime's number counts a different repository. The count below is this one's, taken
+    // from the config this same pass composed.
     expect(declared.length).toBe(414);
   });
 });
